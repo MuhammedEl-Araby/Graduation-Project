@@ -159,21 +159,6 @@ opacity: 0.82;
 font-size: 14px;
 }}
 
-.ac-image-frame {{
-display: flex;
-justify-content: center;
-align-items: center;
-width: 100%;
-}}
-
-.ac-image-frame img {{
-max-width: 100%;
-height: auto;
-border-radius: 12px;
-border: 2px solid rgba(255,255,255,0.25);
-box-shadow: 0 0 24px rgba(0,0,0,0.65);
-}}
-
 </style>
 """
 
@@ -192,9 +177,12 @@ DISCOUNT_RATE = 0.15
 BONUS_RATE = 0.10
 LOYALTY_DISCOUNT_RATE = 0.08
 
+LOW_BASELINE_THRESHOLD_KWH = 2.0
+LOW_BASELINE_MAX_REDUCTION_PERCENT = 10
+
 
 # =========================================================
-# DEFAULT APPLIANCE DATA
+# DEFAULT APPLIANCE CONFIG
 # =========================================================
 
 def default_appliance_config():
@@ -347,22 +335,22 @@ if "ac_unit_states" not in st.session_state:
     }
 
 if "ac_overlay_positions" not in st.session_state:
-    # Coordinates adjusted for the uploaded ACs.png image.
-    # Image size detected: 847 x 658 px.
-    # X/O symbols are placed on the red AC symbols.
-    # Number labels are placed close to the yellow AC number text zones.
+    # Corrected for uploaded ACs.png.
+    # Image size: 847 x 658 px.
+    # x/y = center of red AC symbol.
+    # label_x/label_y = position of yellow AC number label.
     st.session_state.ac_overlay_positions = {
-        "AC 1": {"x": 820, "y": 424, "label_x": 742, "label_y": 421},
-        "AC 2": {"x": 820, "y": 174, "label_x": 739, "label_y": 224},
-        "AC 3": {"x": 24, "y": 412, "label_x": 78, "label_y": 482},
-        "AC 4": {"x": 24, "y": 546, "label_x": 78, "label_y": 589},
-        "AC 5": {"x": 582, "y": 126, "label_x": 509, "label_y": 207},
-        "AC 6": {"x": 133, "y": 112, "label_x": 214, "label_y": 193},
+        "AC 1": {"x": 819, "y": 444, "label_x": 727, "label_y": 424},
+        "AC 2": {"x": 818, "y": 174, "label_x": 730, "label_y": 255},
+        "AC 3": {"x": 20,  "y": 408, "label_x": 79,  "label_y": 481},
+        "AC 4": {"x": 20,  "y": 546, "label_x": 78,  "label_y": 618},
+        "AC 5": {"x": 584, "y": 125, "label_x": 493, "label_y": 207},
+        "AC 6": {"x": 132, "y": 112, "label_x": 213, "label_y": 194},
     }
 
 
 # =========================================================
-# DATAFRAME COLUMN SAFETY
+# DATAFRAME SAFETY
 # =========================================================
 
 def ensure_appliance_columns(df):
@@ -392,19 +380,16 @@ def ensure_appliance_columns(df):
     return df[list(defaults.keys())]
 
 
-st.session_state.appliance_config = ensure_appliance_columns(st.session_state.appliance_config)
+st.session_state.appliance_config = ensure_appliance_columns(
+    st.session_state.appliance_config
+)
 
 
 # =========================================================
-# DATA GENERATION
+# SYNTHETIC DATA GENERATION
 # =========================================================
 
 def generate_training_data(n=5000):
-    """
-    Synthetic dataset for demonstration.
-    The final baseline calculation is hybrid, so user input is never capped.
-    """
-
     np.random.seed(42)
 
     lamps = np.random.randint(1, 300, n)
@@ -442,7 +427,7 @@ def generate_training_data(n=5000):
 
 
 # =========================================================
-# MODEL TRAINING WITHOUT STREAMLIT CACHE
+# MODEL TRAINING
 # =========================================================
 
 def train_model():
@@ -487,43 +472,25 @@ std_usage = training_df["historical_baseline_kwh"].std()
 
 
 # =========================================================
-# UNLIMITED BASELINE CALCULATION
+# HYBRID BASELINE CALCULATION - NO LIMITS
 # =========================================================
 
 def calculate_engineering_baseline(input_df):
-    """
-    Fully calculated engineering-style baseline.
-    No cap is applied to any entered quantity.
-    """
-
     row = input_df.iloc[0].astype(float)
 
-    lamps = row["lamps"]
-    acs = row["acs"]
-    washing = row["washing_machine"]
-    heavy = row["heavy_machines"]
-    occupants = row["occupants"]
-    size = row["house_size"]
-
     engineering_baseline = (
-        0.10 * lamps +
-        1.15 * acs +
-        0.90 * washing +
-        1.55 * heavy +
-        0.32 * occupants +
-        0.010 * size
+        0.10 * row["lamps"] +
+        1.15 * row["acs"] +
+        0.90 * row["washing_machine"] +
+        1.55 * row["heavy_machines"] +
+        0.32 * row["occupants"] +
+        0.010 * row["house_size"]
     )
 
     return max(engineering_baseline, 0.5)
 
 
 def predict_historical_baseline(model, input_df):
-    """
-    Hybrid baseline:
-    - Random Forest for realistic pattern learning
-    - Engineering baseline to guarantee that every number is fully counted
-    """
-
     ml_prediction = float(model.predict(input_df.astype(float))[0])
     engineering_prediction = calculate_engineering_baseline(input_df)
 
@@ -555,17 +522,10 @@ def predict_historical_baseline(model, input_df):
 
 
 # =========================================================
-# HOUSEHOLD INTERPRETATION WITHOUT LIMITS
+# HOUSEHOLD INTERPRETATION - NO LIMITS
 # =========================================================
 
 def describe_household_pattern(lamps, acs, washing, heavy, occupants, size):
-    """
-    Interpretation only.
-    No limit.
-    No blocking.
-    No calculation restriction.
-    """
-
     messages = []
 
     if lamps >= 20 and size <= 80:
@@ -678,15 +638,10 @@ def household_input(title, default_lamps, default_acs, default_washing,
 
 
 # =========================================================
-# CHECKBOX PRIORITY RULES
+# CHECKBOX PRIORITY LOGIC
 # =========================================================
 
 def apply_checkbox_priority_rules(appliance_df):
-    """
-    Converts user-friendly checkbox conditions into internal priority numbers.
-    Lower priority number means disconnect first.
-    """
-
     df = ensure_appliance_columns(appliance_df)
 
     for idx, row in df.iterrows():
@@ -756,7 +711,9 @@ def calculate_current_connected_load(appliance_df):
 
 
 def sync_ac_quantity_with_real_life_page():
-    active_ac_count = sum(1 for state in st.session_state.ac_unit_states.values() if state)
+    active_ac_count = sum(
+        1 for state in st.session_state.ac_unit_states.values() if state
+    )
 
     df = ensure_appliance_columns(st.session_state.appliance_config)
 
@@ -764,7 +721,7 @@ def sync_ac_quantity_with_real_life_page():
         df.loc[df["Appliance"] == "ACs", "Quantity"] = active_ac_count
         df.loc[df["Appliance"] == "ACs", "Connected"] = active_ac_count > 0
     else:
-        new_row = {
+        df.loc[len(df)] = {
             "Appliance": "ACs",
             "Quantity": active_ac_count,
             "Power per Unit kW": 1.3,
@@ -780,7 +737,6 @@ def sync_ac_quantity_with_real_life_page():
             "User Priority": 5,
             "Company Priority": 3
         }
-        df.loc[len(df)] = new_row
 
     st.session_state.appliance_config = apply_checkbox_priority_rules(df)
 
@@ -793,7 +749,8 @@ def smart_meter_shed_load(
     climate_mode,
     mandatory_minimum_percent,
     user_failed_to_respond,
-    enforcement_enabled
+    enforcement_enabled,
+    minimum_service_enabled
 ):
     df = calculate_current_connected_load(appliance_df)
 
@@ -860,11 +817,12 @@ def smart_meter_shed_load(
         appliance = row["Appliance"]
         preserve_minimum = float(row["Preserve Minimum Units"])
 
-        if climate_mode == "Hot Summer - Cooling Priority" and appliance == "ACs":
-            preserve_minimum = max(preserve_minimum, 1)
+        if minimum_service_enabled:
+            if climate_mode == "Hot Summer - Cooling Priority" and appliance == "ACs":
+                preserve_minimum = max(preserve_minimum, 1)
 
-        if climate_mode == "Cold Winter - Heating Priority" and appliance == "Water Heater":
-            preserve_minimum = max(preserve_minimum, 1)
+            if climate_mode == "Cold Winter - Heating Priority" and appliance == "Water Heater":
+                preserve_minimum = max(preserve_minimum, 1)
 
         max_disconnectable_units = max(quantity - preserve_minimum, 0)
 
@@ -891,7 +849,7 @@ def smart_meter_shed_load(
 
 
 # =========================================================
-# BILLING ENGINE
+# BILLING ENGINE WITH COMPATIBLE FAIRNESS CONDITIONS
 # =========================================================
 
 def billing_engine(
@@ -904,7 +862,7 @@ def billing_engine(
     refused_disconnect,
     achieved_reduction_percent,
     mandatory_reduction_percent,
-    scenario_condition
+    fair_conditions
 ):
     premium_usage = max(final_usage - baseline, 0)
     normal_usage = min(final_usage, baseline)
@@ -916,41 +874,86 @@ def billing_engine(
     premium_charge = 0
     discount = 0
     loyalty_discount = 0
+    penalty_waived = 0
     status = []
 
-    if new_company_growth_mode and not grid_stress:
+    if (
+        fair_conditions["growth_bonus"]
+        and new_company_growth_mode
+        and not grid_stress
+    ):
         if final_usage > mean_usage:
             bonus = bill * BONUS_RATE
-            bill = bill - bonus
-            status.append("Growth bonus applied because company wants to increase average demand.")
+            bill -= bonus
+            status.append("Growth bonus applied because the company wants to increase average demand.")
         else:
-            status.append("Normal bill. Usage is still below desired growth level.")
+            status.append("Growth mode active, but usage is still below desired growth level.")
 
     if grid_stress:
-        if premium_usage > 0:
-            premium_charge = premium_usage * PREMIUM_PRESERVATION_RATE
-            bill += premium_charge
-            status.append("Premium Load Preservation Pricing applied for usage above the customer's own historical baseline.")
+        if fair_conditions["marginal_premium"]:
+            if premium_usage > 0:
+                premium_charge = premium_usage * PREMIUM_PRESERVATION_RATE
+                bill += premium_charge
+                status.append("Premium pricing applied only to usage above the customer's own historical baseline.")
+        else:
+            if final_usage > baseline:
+                premium_charge = final_usage * 0.30
+                bill += premium_charge
+                status.append("General premium pricing applied because marginal baseline protection is disabled.")
 
-        if achieved_reduction_percent < mandatory_reduction_percent:
+    penalty_should_apply = (
+        grid_stress
+        and achieved_reduction_percent < mandatory_reduction_percent
+    )
+
+    if (
+        penalty_should_apply
+        and fair_conditions["low_baseline_protection"]
+        and baseline <= LOW_BASELINE_THRESHOLD_KWH
+        and final_usage <= baseline
+    ):
+        penalty_waived = final_usage * 0.20
+        penalty_should_apply = False
+        status.append("Penalty waived by low-baseline protection because the customer stayed within normal usage.")
+
+    if penalty_should_apply:
+        if fair_conditions["progressive_penalty"]:
+            shortfall = mandatory_reduction_percent - achieved_reduction_percent
+            shortfall_ratio = shortfall / max(mandatory_reduction_percent, 1)
+            penalty = final_usage * 0.20 * shortfall_ratio
+            status.append("Progressive penalty applied based on reduction shortfall.")
+        else:
             penalty = final_usage * 0.20
-            bill += penalty
-            status.append("Mandatory reduction target was not achieved. Grid stress penalty applied.")
+            status.append("Flat grid stress penalty applied because mandatory reduction was not achieved.")
 
-        if achieved_reduction_percent >= mandatory_reduction_percent:
-            discount = bill * DISCOUNT_RATE
-            bill -= discount
-            status.append("Grid support discount applied because mandatory reduction was achieved.")
+        bill += penalty
 
-    if scenario_condition == "Condition 2 - Historical Baseline Protection":
-        if grid_stress and final_usage <= baseline:
-            loyalty_discount = bill * LOYALTY_DISCOUNT_RATE
-            bill -= loyalty_discount
-            discount += loyalty_discount
-            status.append("Loyalty discount applied because usage stayed at or below the customer's own historical baseline during peak stress.")
+    if (
+        fair_conditions["grid_support_discount"]
+        and grid_stress
+        and achieved_reduction_percent >= mandatory_reduction_percent
+    ):
+        discount_value = bill * DISCOUNT_RATE
+        bill -= discount_value
+        discount += discount_value
+        status.append("Grid support discount applied because mandatory reduction was achieved.")
+
+    if (
+        fair_conditions["loyalty_discount"]
+        and fair_conditions["historical_baseline"]
+        and grid_stress
+        and final_usage <= baseline
+    ):
+        loyalty_discount = bill * LOYALTY_DISCOUNT_RATE
+        bill -= loyalty_discount
+        discount += loyalty_discount
+        status.append("Loyalty discount applied because usage stayed at or below historical baseline during peak stress.")
 
     if refused_disconnect and grid_stress:
-        status.append("User refused smart meter disconnection. Premium convenience pricing applied.")
+        if fair_conditions["customer_autonomy"]:
+            status.append("User used manual override. Premium pricing or emergency enforcement may apply depending on physical grid stress.")
+        else:
+            status.append("User refused disconnection, but customer autonomy condition is disabled.")
 
     if not status:
         status.append("Normal billing condition.")
@@ -960,6 +963,7 @@ def billing_engine(
         "Premium Usage kWh": premium_usage,
         "Premium Charge": premium_charge,
         "Penalty": penalty,
+        "Penalty Waived": penalty_waived,
         "Bonus": bonus,
         "Discount": discount,
         "Loyalty Discount": loyalty_discount,
@@ -1050,11 +1054,14 @@ def render_ac_plan_overlay(image_path, ac_states, positions):
     image = Image.open(image_path).convert("RGBA")
     draw = ImageDraw.Draw(image)
 
-    symbol_font = get_font(78)
-    label_font = get_font(24)
+    symbol_font = get_font(96)
+    label_font = get_font(28)
 
     for ac_name, is_on in ac_states.items():
-        pos = positions.get(ac_name, {"x": 100, "y": 100, "label_x": 130, "label_y": 130})
+        pos = positions.get(
+            ac_name,
+            {"x": 100, "y": 100, "label_x": 130, "label_y": 130}
+        )
 
         x = int(pos["x"])
         y = int(pos["y"])
@@ -1071,7 +1078,7 @@ def render_ac_plan_overlay(image_path, ac_states, positions):
             font=symbol_font,
             fill=color,
             outline_fill="black",
-            outline_width=7
+            outline_width=9
         )
 
         draw_label_box(
@@ -1112,15 +1119,8 @@ with st.sidebar:
 
     st.header("Model Performance")
 
-    st.metric(
-        "MAE",
-        f"{metrics['MAE']:.2f} kWh"
-    )
-
-    st.metric(
-        "Model Score R²",
-        f"{metrics['R2']:.2f}"
-    )
+    st.metric("MAE", f"{metrics['MAE']:.2f} kWh")
+    st.metric("Model Score R²", f"{metrics['R2']:.2f}")
 
     st.divider()
 
@@ -1176,147 +1176,68 @@ The system is not a real utility SCADA system. It is a safe simulation that demo
 
 <div class="manual-box">
 
-## 2. Recommended Operator Workflow
+## 2. Fairness Conditions
 
-A first-time user should follow this order:
+The fairness conditions can work together.
 
-1. Open **Smart Meter Override Page**
-2. Select user priority or company priority
-3. Decide which appliances are connected
-4. Mark loads as critical, comfort, luxury, or shed-first
-5. Open **Real Life Simulation**
-6. Turn AC units ON or OFF directly on the HVAC plan
-7. Open **SCADA Control Center**
-8. Choose a SCADA operating condition
-9. Activate or deactivate grid stress and peak event conditions
-10. Review achieved reduction
-11. Review final bill, penalties, discounts, and condition evaluation
+You can activate:
 
-</div>
+- District-wide reduction
+- Historical baseline protection
+- Premium only above own baseline
+- Low-baseline customer protection
+- Customer autonomy
+- Critical load protection
+- Minimum service preservation
+- Emergency enforcement
+- Grid support discount
+- Loyalty discount
+- Progressive penalty
+- Growth bonus
 
-<div class="manual-box">
-
-## 3. SCADA Operating Conditions
-
-### Condition 1 - District-Wide Percentage Reduction
-
-The utility applies the same percentage reduction to every entity.
-
-This is simple, but it can be unfair.
-
-Example:
-
-- Person A has only 3 lamps
-- Person B has washing machine, 4 ACs, and heavy machines
-
-If both receive the same reduction percentage:
-
-- Person A may lose basic lighting
-- Person B can trim luxury/excess load while keeping useful service
-
-### Condition 2 - Historical Baseline Protection
-
-Each user is compared with their own historical baseline.
-
-The user pays normal rate up to their own normal level.
-
-The user pays extra only above their own baseline.
-
-If the user stays below baseline during peak stress, a loyalty discount can apply.
-
-### Condition 3 - Customer Autonomy With Manual Override
-
-The utility sends the signal, but the customer controls appliance priorities.
-
-Critical loads are protected.
-
-Non-critical, luxury, or shed-first loads disconnect earlier.
-
-The user can refuse automatic shedding, but premium pricing or emergency enforcement may apply.
+This makes the simulation closer to a real smart-grid policy engine.
 
 </div>
 
 <div class="manual-box">
 
-## 4. Smart Meter Override Page
+## 3. Smart Meter Override Page
 
-This page is now checkbox-based.
+Use checkboxes instead of priority numbers.
 
-You do not need to manually write priority numbers.
-
-### Shed First
-
-The appliance disconnects early.
-
-### Comfort Load
-
-The system tries to preserve this load if possible.
-
-### Luxury Load
-
-The appliance can be disconnected before comfort loads.
-
-### Critical / Never Disconnect
-
-The appliance is protected and will not be disconnected.
-
-### Allow Company Emergency Control
-
-The company can use this appliance during emergency enforcement.
-
-### Preserve Minimum Units
-
-This protects a minimum number of units.
-
-Example:
-
-If AC quantity is 6 and preserve minimum is 2, then only 4 AC units can be disconnected.
+- **Shed First** means disconnect early.
+- **Comfort Load** means preserve if possible.
+- **Luxury Load** means shed before comfort load.
+- **Critical Load** means never disconnect.
+- **Allow Company Emergency Control** means company can use this appliance during physical emergency.
+- **Preserve Minimum Units** protects a minimum number of units.
 
 </div>
 
 <div class="manual-box">
 
-## 5. Real Life Simulation Page
+## 4. Real Life Simulation
 
-Place your AutoCAD/HVAC image in the project folder with this exact name:
+Place your HVAC image in the app folder with the exact name:
 
 **ACs.png**
 
-The page shows six AC controls.
+The page overlays:
 
-- Green **O** means working
-- Red **X** means disconnected
+- Green **O** for working AC
+- Red **X** for disconnected AC
 
-The image updates while the app is running.
-
-The AC quantity in the smart meter is synchronized with the number of working ACs.
+The number of working ACs is synchronized with the AC row in the smart meter table.
 
 </div>
 
 <div class="manual-box">
 
-## 6. Important Billing Logic
+## 5. No Equipment Limits
 
-The bill can include:
+The simulator does not limit lamps, ACs, washing machines, heavy machines, occupants, or house size.
 
-- Normal usage charge
-- Premium charge above historical baseline
-- Penalty if required reduction is not achieved
-- Grid support discount if mandatory reduction is achieved
-- Loyalty discount if usage stays below historical baseline during stress
-- Growth bonus if the company wants to increase average usage
-
-</div>
-
-<div class="manual-box">
-
-## 7. No Equipment Limits
-
-The simulator no longer limits the number of lamps, ACs, washing machines, heavy machines, occupants, or house size.
-
-Any number you enter is calculated.
-
-Messages about unusual patterns are only interpretations, not restrictions.
+Every number entered by the user is included in the calculation.
 
 </div>
     """, unsafe_allow_html=True)
@@ -1337,7 +1258,7 @@ if page == "AI & Model Details":
 
 ## Dataset
 
-The dataset is synthetic. It is generated inside the program for training and demonstration.
+The dataset is synthetic and generated inside the program for training and demonstration.
 
 Features:
 
@@ -1360,9 +1281,7 @@ Output:
 
 The model used here is a Random Forest Regressor.
 
-A random forest is a group of many decision trees.
-
-Each tree gives a prediction, then the model averages the trees to produce a final result.
+A random forest is a group of many decision trees. Each tree gives a prediction, then the model averages the trees to produce a final result.
 
 </div>
 
@@ -1372,9 +1291,7 @@ Each tree gives a prediction, then the model averages the trees to produce a fin
 
 The simulator does not depend only on Random Forest.
 
-Random Forest can be weak outside the training range.
-
-So this version uses:
+Random Forest can be weak outside the training range, so this version uses:
 
 - Random Forest prediction
 - Engineering-style calculation
@@ -1389,9 +1306,7 @@ This guarantees that every entered unit is counted.
 
 MAE means Mean Absolute Error.
 
-It tells the average prediction error in kWh.
-
-Lower MAE is better.
+It tells the average prediction error in kWh. Lower MAE is better.
 
 </div>
 
@@ -1415,8 +1330,6 @@ Gaussian randomness means normal-distribution noise.
 
 It is added because real electrical consumption is not perfectly fixed.
 
-Two similar homes may still consume different amounts because of behavior, weather, insulation, and appliance efficiency.
-
 </div>
 
 <div class="manual-box">
@@ -1430,8 +1343,6 @@ In a real system, the customer-facing name should be:
 or
 
 **Customer Historical Consumption Profile**
-
-This sounds operational and confidential, instead of saying "AI prediction" to the user.
 
 </div>
     """, unsafe_allow_html=True)
@@ -1494,6 +1405,7 @@ This sounds operational and confidential, instead of saying "AI prediction" to t
 if page == "Real Life Simulation":
 
     st.title("Real Life Simulation")
+
     st.warning(
         "This page simulates a real HVAC plan. Put your plan image in the project folder with the exact name ACs.png."
     )
@@ -1522,7 +1434,9 @@ Use the controls below to turn each AC ON or OFF. The image updates immediately.
 
     sync_ac_quantity_with_real_life_page()
 
-    active_ac_count = sum(1 for state in st.session_state.ac_unit_states.values() if state)
+    active_ac_count = sum(
+        1 for state in st.session_state.ac_unit_states.values() if state
+    )
     disconnected_ac_count = len(st.session_state.ac_unit_states) - active_ac_count
 
     m1, m2, m3 = st.columns(3)
@@ -1542,8 +1456,8 @@ Use the controls below to turn each AC ON or OFF. The image updates immediately.
 
     with st.expander("Edit X/O and AC Number Positions on the Plan"):
         st.info(
-            "The default coordinates are adjusted for your uploaded image size 847 x 658 px. "
-            "If GitHub or browser scaling changes the visual result, adjust x/y and label_x/label_y here."
+            "Default coordinates are adjusted for the uploaded image size 847 x 658 px. "
+            "Adjust x/y and label_x/label_y if needed."
         )
 
         position_rows = []
@@ -1586,7 +1500,7 @@ Use the controls below to turn each AC ON or OFF. The image updates immediately.
         positions=st.session_state.ac_overlay_positions
     )
 
-    center_left, center_main, center_right = st.columns([0.04, 0.92, 0.04])
+    center_left, center_main, center_right = st.columns([0.03, 0.94, 0.03])
 
     with center_main:
         st.image(
@@ -1622,6 +1536,7 @@ Use the controls below to turn each AC ON or OFF. The image updates immediately.
 if page == "Smart Meter Override Page":
 
     st.title("Smart Meter Override Page")
+
     st.warning(
         "This page lets the client manually override smart meter priority rules. "
         "The user's choices affect the SCADA Control Center simulation."
@@ -1675,12 +1590,9 @@ if page == "Smart Meter Override Page":
             if st.session_state.climate_mode in climate_options else 0
         )
 
-    if st.session_state.climate_mode == "Hot Summer - Cooling Priority":
-        st.info("Cooling priority is active. The system will try to preserve at least one AC if possible.")
-    elif st.session_state.climate_mode == "Cold Winter - Heating Priority":
-        st.info("Heating priority is active. The system will try to preserve at least one water heater if possible.")
-    else:
-        st.info("Normal operation is active. No seasonal preservation is automatically added.")
+    st.info(
+        "The table uses checkboxes. Internal priority numbers are calculated automatically."
+    )
 
     st.subheader("Edit Appliance Status and SCADA Conditions")
 
@@ -1711,7 +1623,12 @@ if page == "Smart Meter Override Page":
     category_conflict_rows = []
 
     for _, row in edited_df.iterrows():
-        active_categories = int(bool(row["Shed First"])) + int(bool(row["Comfort Load"])) + int(bool(row["Luxury Load"])) + int(bool(row["Critical Load"]))
+        active_categories = (
+            int(bool(row["Shed First"])) +
+            int(bool(row["Comfort Load"])) +
+            int(bool(row["Luxury Load"])) +
+            int(bool(row["Critical Load"]))
+        )
 
         if active_categories > 1:
             category_conflict_rows.append(row["Appliance"])
@@ -1777,87 +1694,122 @@ st.warning(
 st.markdown("""
 <div class="scada-card">
 <div class="big-status">Integrated Operating Scenario</div>
-This dashboard combines historical baseline calculation, dynamic tariffs, manual smart meter override,
-priority-based load shedding, mandatory grid protection, customer autonomy, and premium uninterrupted consumption pricing.
+This dashboard combines historical baseline calculation, dynamic tariffs, compatible fairness conditions,
+manual smart meter override, priority-based load shedding, mandatory grid protection,
+customer autonomy, and premium uninterrupted consumption pricing.
 </div>
 """, unsafe_allow_html=True)
 
 
 # =========================================================
-# SCADA OPERATING CONDITION
+# FAIRNESS CONDITION ENGINE
 # =========================================================
 
-st.header("SCADA Operating Condition")
+st.header("SCADA Fairness & Protection Conditions")
 
-scenario_condition = st.selectbox(
-    "Select SCADA Operating Condition",
-    [
-        "Condition 1 - District-Wide Percentage Reduction",
-        "Condition 2 - Historical Baseline Protection",
-        "Condition 3 - Customer Autonomy With Manual Override",
-        "Custom Manual Operation"
-    ]
+st.markdown("""
+<div class="scada-card">
+<div class="big-status">Compatible Fairness Conditions</div>
+These conditions are not exclusive. You can activate several of them together to make the SCADA decision more fair and realistic.
+</div>
+""", unsafe_allow_html=True)
+
+fc1, fc2, fc3 = st.columns(3)
+
+with fc1:
+    condition_district_reduction = st.checkbox(
+        "District-wide load reduction",
+        value=True,
+        help="Utility requests a reduction percentage from all entities during high district load."
+    )
+
+    condition_historical_baseline = st.checkbox(
+        "Historical baseline protection",
+        value=True,
+        help="Each customer is compared to their own historical baseline, not to neighbors."
+    )
+
+    condition_marginal_premium = st.checkbox(
+        "Premium only above own baseline",
+        value=True,
+        help="Premium pricing applies only to usage above the customer's own baseline."
+    )
+
+    condition_low_baseline_protection = st.checkbox(
+        "Low-baseline customer protection",
+        value=True,
+        help="Protects very low users from unfair shutdown or excessive penalty."
+    )
+
+with fc2:
+    condition_customer_autonomy = st.checkbox(
+        "Customer autonomy / manual override",
+        value=True,
+        help="Customer can choose appliance priorities and can refuse automatic shedding."
+    )
+
+    condition_critical_load_protection = st.checkbox(
+        "Critical loads never disconnect",
+        value=True,
+        help="Critical loads such as lighting, refrigerators, or medical equipment are protected."
+    )
+
+    condition_minimum_service = st.checkbox(
+        "Minimum service preservation",
+        value=True,
+        help="Preserves minimum units such as at least one AC in hot weather or one heater in cold weather."
+    )
+
+    condition_emergency_enforcement = st.checkbox(
+        "Physical-grid emergency enforcement",
+        value=True,
+        help="If the line is physically stressed, the company can enforce minimum reduction after deadline."
+    )
+
+with fc3:
+    condition_grid_support_discount = st.checkbox(
+        "Grid support discount",
+        value=True,
+        help="Discount applies if the mandatory reduction is achieved during grid stress."
+    )
+
+    condition_loyalty_discount = st.checkbox(
+        "Loyalty discount below baseline",
+        value=True,
+        help="Extra discount if the customer stays at or below their own baseline during peak stress."
+    )
+
+    condition_progressive_penalty = st.checkbox(
+        "Progressive penalty by shortfall",
+        value=True,
+        help="Penalty depends on how far the customer is from the required reduction."
+    )
+
+    condition_growth_bonus = st.checkbox(
+        "Company growth bonus when grid is stable",
+        value=False,
+        help="If the company wants demand growth and the grid is stable, high usage can receive a bonus."
+    )
+
+fair_conditions = {
+    "district_reduction": condition_district_reduction,
+    "historical_baseline": condition_historical_baseline,
+    "marginal_premium": condition_marginal_premium,
+    "low_baseline_protection": condition_low_baseline_protection,
+    "customer_autonomy": condition_customer_autonomy,
+    "critical_load_protection": condition_critical_load_protection,
+    "minimum_service": condition_minimum_service,
+    "emergency_enforcement": condition_emergency_enforcement,
+    "grid_support_discount": condition_grid_support_discount,
+    "loyalty_discount": condition_loyalty_discount,
+    "progressive_penalty": condition_progressive_penalty,
+    "growth_bonus": condition_growth_bonus
+}
+
+st.info(
+    "Active fairness rules are combined together. For example, district-wide reduction, historical baseline protection, "
+    "customer autonomy, low-baseline protection, and emergency enforcement can all work at the same time."
 )
-
-if scenario_condition == "Condition 1 - District-Wide Percentage Reduction":
-    st.warning(
-        "Condition 1 active: The district has high load. The utility applies the same reduction percentage to each entity. "
-        "This demonstrates why a simple percentage rule can be unfair for low-baseline users."
-    )
-
-    st.markdown("""
-    ### Fairness Warning
-
-    A fixed percentage reduction can be unfair.
-
-    Example:
-
-    - Person A has only 3 lamps and a very low baseline.
-    - Person B has washing machine, 4 ACs, and heavy machines.
-
-    If both are asked to reduce the same percentage:
-
-    - Person A may lose essential lighting.
-    - Person B can reduce luxury or excess load while keeping useful service.
-    """)
-
-elif scenario_condition == "Condition 2 - Historical Baseline Protection":
-    st.success(
-        "Condition 2 active: Each user is judged against their own historical baseline, not against neighbors."
-    )
-
-    st.markdown("""
-    ### Baseline Fairness Logic
-
-    The customer pays normal rate up to their own historical baseline.
-
-    - Usage up to own baseline = normal
-    - Usage above own baseline = premium
-    - Staying below baseline during stress = loyalty discount
-
-    This protects normal lifestyle while discouraging extra peak consumption.
-    """)
-
-elif scenario_condition == "Condition 3 - Customer Autonomy With Manual Override":
-    st.info(
-        "Condition 3 active: The customer has strong control over priorities and can reject automatic shedding."
-    )
-
-    st.markdown("""
-    ### Customer Autonomy Logic
-
-    The utility sends the signal, but the customer decides appliance priorities.
-
-    - Critical loads are never disconnected.
-    - Comfort loads are preserved if possible.
-    - Luxury loads can be shed earlier.
-    - Shed-first loads disconnect first.
-
-    The user may refuse automatic shedding, but premium pricing or emergency enforcement may apply during real line stress.
-    """)
-
-else:
-    st.info("Custom manual operation active. You control the SCADA settings manually.")
 
 
 # =========================================================
@@ -1869,28 +1821,16 @@ st.header("Grid Event & Company Control Panel")
 g1, g2, g3, g4 = st.columns(4)
 
 with g1:
-    grid_stress = st.checkbox(
-        "Real Stress On Line",
-        value=True
-    )
+    grid_stress = st.checkbox("Real Stress On Line", value=True)
 
 with g2:
-    peak_event = st.checkbox(
-        "Peak Usage Event",
-        value=True
-    )
+    peak_event = st.checkbox("Peak Usage Event", value=True)
 
 with g3:
-    new_company_growth_mode = st.checkbox(
-        "New Company Growth Mode",
-        value=False
-    )
+    new_company_growth_mode = st.checkbox("New Company Growth Mode", value=False)
 
 with g4:
-    enforcement_enabled = st.checkbox(
-        "Emergency Enforcement Enabled",
-        value=True
-    )
+    enforcement_enabled = st.checkbox("Emergency Enforcement Enabled", value=True)
 
 st.subheader("SCADA Reduction Commands")
 
@@ -1933,11 +1873,11 @@ user_failed_to_respond = st.checkbox(
 if grid_stress and peak_event:
     st.error(
         f"SCADA Alert: Line stress is real. User must reduce at least "
-        f"{mandatory_reduction_percent}% even if premium payment is accepted."
+        f"{mandatory_reduction_percent}% unless fairness protections modify the effective requirement."
     )
 else:
     st.success(
-        "Grid is stable. Pricing and bonus modes can operate without mandatory protection."
+        "Grid is stable. Pricing and bonus modes can operate without mandatory physical protection."
     )
 
 
@@ -1985,20 +1925,9 @@ st.header("Historical Consumption Baselines")
 
 m1, m2, m3 = st.columns(3)
 
-m1.metric(
-    "Historical Baseline - Person A",
-    f"{baseline_a:.2f} kWh"
-)
-
-m2.metric(
-    "Historical Baseline - Person B",
-    f"{baseline_b:.2f} kWh"
-)
-
-m3.metric(
-    "Population Mean Baseline",
-    f"{mean_usage:.2f} kWh"
-)
+m1.metric("Historical Baseline - Person A", f"{baseline_a:.2f} kWh")
+m2.metric("Historical Baseline - Person B", f"{baseline_b:.2f} kWh")
+m3.metric("Population Mean Baseline", f"{mean_usage:.2f} kWh")
 
 
 # =========================================================
@@ -2014,10 +1943,7 @@ selected_person = st.radio(
     horizontal=True
 )
 
-if selected_person == "Person A":
-    selected_baseline = baseline_a
-else:
-    selected_baseline = baseline_b
+selected_baseline = baseline_a if selected_person == "Person A" else baseline_b
 
 
 # =========================================================
@@ -2039,22 +1965,62 @@ st.info(
 
 
 # =========================================================
-# SMART METER SIMULATION
+# EFFECTIVE FAIR REDUCTION LOGIC
 # =========================================================
 
 policy_mode = st.session_state.selected_user_policy
 refuse_disconnect = st.session_state.refuse_disconnect
 climate_mode = st.session_state.climate_mode
 
+effective_voluntary_reduction_percent = voluntary_reduction_percent
+effective_mandatory_reduction_percent = mandatory_reduction_percent
+
+if (
+    fair_conditions["low_baseline_protection"]
+    and selected_baseline <= LOW_BASELINE_THRESHOLD_KWH
+):
+    effective_voluntary_reduction_percent = min(
+        effective_voluntary_reduction_percent,
+        LOW_BASELINE_MAX_REDUCTION_PERCENT
+    )
+
+    effective_mandatory_reduction_percent = min(
+        effective_mandatory_reduction_percent,
+        LOW_BASELINE_MAX_REDUCTION_PERCENT
+    )
+
+    st.warning(
+        f"Low-baseline protection is active. Because this customer baseline is {selected_baseline:.2f} kWh, "
+        f"the effective reduction request is capped at {LOW_BASELINE_MAX_REDUCTION_PERCENT}%."
+    )
+
+if not fair_conditions["district_reduction"]:
+    effective_voluntary_reduction_percent = 0
+    st.info(
+        "District-wide load reduction is disabled. Voluntary reduction request is set to 0%, "
+        "but emergency mandatory protection can still apply if enabled."
+    )
+
+
+# =========================================================
+# SMART METER SIMULATION
+# =========================================================
+
 shed_df, original_load_kw, final_load_kw, achieved_reduction_percent, enforcement_status = smart_meter_shed_load(
     appliance_df=st.session_state.appliance_config,
-    requested_reduction_percent=voluntary_reduction_percent,
+    requested_reduction_percent=effective_voluntary_reduction_percent,
     policy_mode=policy_mode,
     refuse_disconnect=refuse_disconnect,
     climate_mode=climate_mode,
-    mandatory_minimum_percent=mandatory_reduction_percent,
+    mandatory_minimum_percent=effective_mandatory_reduction_percent,
     user_failed_to_respond=user_failed_to_respond,
-    enforcement_enabled=enforcement_enabled and grid_stress and peak_event
+    enforcement_enabled=(
+        enforcement_enabled
+        and grid_stress
+        and peak_event
+        and fair_conditions["emergency_enforcement"]
+    ),
+    minimum_service_enabled=fair_conditions["minimum_service"]
 )
 
 if original_load_kw > 0:
@@ -2073,8 +2039,8 @@ billing = billing_engine(
     new_company_growth_mode=new_company_growth_mode,
     refused_disconnect=refuse_disconnect,
     achieved_reduction_percent=achieved_reduction_percent,
-    mandatory_reduction_percent=mandatory_reduction_percent,
-    scenario_condition=scenario_condition
+    mandatory_reduction_percent=effective_mandatory_reduction_percent,
+    fair_conditions=fair_conditions
 )
 
 
@@ -2093,14 +2059,14 @@ s3.metric("Achieved Reduction", f"{achieved_reduction_percent:.2f}%")
 s4.metric("Final Usage", f"{final_usage:.2f} kWh")
 s5.metric("Final Bill", f"{billing['Final Bill']:.2f} EGP")
 
-if achieved_reduction_percent < mandatory_reduction_percent and grid_stress and peak_event:
-    st.error(
-        "Grid Protection Warning: The mandatory reduction target was not achieved."
-    )
+e1, e2 = st.columns(2)
+e1.metric("Effective Voluntary Reduction", f"{effective_voluntary_reduction_percent:.2f}%")
+e2.metric("Effective Mandatory Reduction", f"{effective_mandatory_reduction_percent:.2f}%")
+
+if achieved_reduction_percent < effective_mandatory_reduction_percent and grid_stress and peak_event:
+    st.error("Grid Protection Warning: The effective mandatory reduction target was not achieved.")
 else:
-    st.success(
-        "Grid Protection Status: Reduction condition is acceptable."
-    )
+    st.success("Grid Protection Status: Effective reduction condition is acceptable.")
 
 st.info(enforcement_status)
 
@@ -2110,64 +2076,107 @@ st.info(enforcement_status)
 # =========================================================
 
 st.divider()
-st.header("SCADA Condition Evaluation")
+st.header("SCADA Fairness Condition Evaluation")
 
 condition_rows = []
 
-if scenario_condition == "Condition 1 - District-Wide Percentage Reduction":
-    condition_rows.append({
-        "Condition": "District-wide reduction",
-        "Rule": f"Utility requests {voluntary_reduction_percent}% reduction from each entity",
-        "Result": f"Achieved reduction = {achieved_reduction_percent:.2f}%",
-        "Status": "Satisfied" if achieved_reduction_percent >= voluntary_reduction_percent else "Not satisfied"
-    })
+condition_rows.append({
+    "Condition": "District-wide load reduction",
+    "Active": fair_conditions["district_reduction"],
+    "Rule": f"Utility requests {effective_voluntary_reduction_percent}% effective reduction",
+    "Result": f"Achieved {achieved_reduction_percent:.2f}%",
+    "Status": "Satisfied" if achieved_reduction_percent >= effective_voluntary_reduction_percent else "Not satisfied"
+})
 
-if scenario_condition == "Condition 2 - Historical Baseline Protection":
-    condition_rows.append({
-        "Condition": "Historical baseline protection",
-        "Rule": "Customer is judged against own historical baseline, not neighbor usage",
-        "Result": f"Final usage {final_usage:.2f} kWh vs baseline {selected_baseline:.2f} kWh",
-        "Status": "Protected normal usage" if final_usage <= selected_baseline else "Above own historical baseline"
-    })
+condition_rows.append({
+    "Condition": "Historical baseline protection",
+    "Active": fair_conditions["historical_baseline"],
+    "Rule": "Customer is judged against own historical baseline",
+    "Result": f"Final usage {final_usage:.2f} kWh vs baseline {selected_baseline:.2f} kWh",
+    "Status": "Within own baseline" if final_usage <= selected_baseline else "Above own baseline"
+})
 
-if scenario_condition == "Condition 3 - Customer Autonomy With Manual Override":
-    condition_rows.append({
-        "Condition": "Customer autonomy",
-        "Rule": "Customer can define critical loads and reject automatic shedding",
-        "Result": "User refused automatic shedding" if refuse_disconnect else "User accepted smart meter control",
-        "Status": "Premium or enforcement may apply" if refuse_disconnect else "Normal smart-meter control"
-    })
+condition_rows.append({
+    "Condition": "Marginal premium above baseline",
+    "Active": fair_conditions["marginal_premium"],
+    "Rule": "Premium applies only above own baseline",
+    "Result": f"Premium usage {billing['Premium Usage kWh']:.2f} kWh",
+    "Status": "Premium applied" if billing["Premium Charge"] > 0 else "No premium"
+})
+
+condition_rows.append({
+    "Condition": "Low-baseline protection",
+    "Active": fair_conditions["low_baseline_protection"],
+    "Rule": "Protect very low users from unfair shutdown or excessive penalty",
+    "Result": f"Baseline {selected_baseline:.2f} kWh",
+    "Status": "Protection applied" if selected_baseline <= LOW_BASELINE_THRESHOLD_KWH else "Not low-baseline case"
+})
+
+condition_rows.append({
+    "Condition": "Customer autonomy",
+    "Active": fair_conditions["customer_autonomy"],
+    "Rule": "Customer can set priorities and refuse automatic shedding",
+    "Result": "Refused automatic shedding" if refuse_disconnect else "Accepted smart meter control",
+    "Status": "Override active" if refuse_disconnect else "Normal control"
+})
+
+condition_rows.append({
+    "Condition": "Critical load protection",
+    "Active": fair_conditions["critical_load_protection"],
+    "Rule": "Critical loads are never disconnected",
+    "Result": "Critical loads protected through smart meter table",
+    "Status": "Enabled" if fair_conditions["critical_load_protection"] else "Disabled"
+})
+
+condition_rows.append({
+    "Condition": "Minimum service preservation",
+    "Active": fair_conditions["minimum_service"],
+    "Rule": "Preserve minimum service such as AC in hot mode or heater in cold mode",
+    "Result": climate_mode,
+    "Status": "Enabled" if fair_conditions["minimum_service"] else "Disabled"
+})
+
+condition_rows.append({
+    "Condition": "Emergency physical-grid enforcement",
+    "Active": fair_conditions["emergency_enforcement"],
+    "Rule": "Company can enforce minimum reduction if line stress is real",
+    "Result": enforcement_status,
+    "Status": "Available" if fair_conditions["emergency_enforcement"] else "Disabled"
+})
 
 condition_rows.append({
     "Condition": "Grid support discount",
-    "Rule": f"Achieve at least {mandatory_reduction_percent}% reduction during stress",
+    "Active": fair_conditions["grid_support_discount"],
+    "Rule": f"Achieve at least {effective_mandatory_reduction_percent}% reduction",
     "Result": f"Achieved {achieved_reduction_percent:.2f}%",
-    "Status": "Discount applied" if grid_stress and peak_event and achieved_reduction_percent >= mandatory_reduction_percent else "No discount"
+    "Status": "Discount applied" if billing["Discount"] > 0 else "No discount"
 })
 
 condition_rows.append({
-    "Condition": "Grid stress penalty",
-    "Rule": f"Penalty if reduction is below {mandatory_reduction_percent}%",
-    "Result": f"Achieved {achieved_reduction_percent:.2f}%",
-    "Status": "Penalty applied" if grid_stress and peak_event and achieved_reduction_percent < mandatory_reduction_percent else "No penalty"
+    "Condition": "Loyalty discount",
+    "Active": fair_conditions["loyalty_discount"],
+    "Rule": "Stay at or below own historical baseline during peak stress",
+    "Result": f"Loyalty discount {billing['Loyalty Discount']:.2f} EGP",
+    "Status": "Applied" if billing["Loyalty Discount"] > 0 else "Not applied"
 })
 
 condition_rows.append({
-    "Condition": "Premium usage above baseline",
-    "Rule": "Pay premium only for usage above own historical baseline",
-    "Result": f"Premium usage = {billing['Premium Usage kWh']:.2f} kWh",
-    "Status": "Premium preservation pricing applied" if final_usage > selected_baseline and grid_stress and peak_event else "No premium above baseline"
+    "Condition": "Progressive penalty",
+    "Active": fair_conditions["progressive_penalty"],
+    "Rule": "Penalty increases according to reduction shortfall",
+    "Result": f"Penalty {billing['Penalty']:.2f} EGP",
+    "Status": "Applied" if billing["Penalty"] > 0 else "No penalty"
 })
 
 condition_rows.append({
-    "Condition": "Loyalty baseline discount",
-    "Rule": "Stay at or below own baseline during peak stress",
-    "Result": f"Loyalty discount = {billing['Loyalty Discount']:.2f} EGP",
-    "Status": "Loyalty discount applied" if billing["Loyalty Discount"] > 0 else "No loyalty discount"
+    "Condition": "Penalty waiver",
+    "Active": fair_conditions["low_baseline_protection"],
+    "Rule": "Penalty can be waived for low-baseline customers staying within baseline",
+    "Result": f"Penalty waived {billing['Penalty Waived']:.2f} EGP",
+    "Status": "Waived" if billing["Penalty Waived"] > 0 else "Not waived"
 })
 
 condition_df = pd.DataFrame(condition_rows)
-
 st.dataframe(condition_df, use_container_width=True)
 
 
@@ -2192,13 +2201,13 @@ if refuse_disconnect:
 if new_company_growth_mode and not grid_stress:
     st.success(
         "Growth Mode Active: The company wants to increase average consumption. "
-        "Users above the average may receive a bonus instead of penalty."
+        "Users above the average may receive a bonus if growth bonus condition is active."
     )
 
 if climate_mode == "Hot Summer - Cooling Priority":
-    st.info("Climate Mode: Hot summer cooling priority. AC protection is applied when possible.")
+    st.info("Climate Mode: Hot summer cooling priority. AC protection is applied when minimum service preservation is active.")
 elif climate_mode == "Cold Winter - Heating Priority":
-    st.info("Climate Mode: Cold winter heating priority. Water heater protection is applied when possible.")
+    st.info("Climate Mode: Cold winter heating priority. Water heater protection is applied when minimum service preservation is active.")
 else:
     st.info("Climate Mode: Normal operation. No automatic seasonal equipment protection.")
 
@@ -2219,7 +2228,6 @@ st.header("Billing & Condition Results")
 
 billing_df = pd.DataFrame([{
     "Client": selected_person,
-    "Scenario Condition": scenario_condition,
     "Baseline kWh": selected_baseline,
     "Requested Usage kWh": requested_usage,
     "Final Usage kWh": final_usage,
@@ -2227,6 +2235,7 @@ billing_df = pd.DataFrame([{
     "Premium Usage kWh": billing["Premium Usage kWh"],
     "Premium Charge EGP": billing["Premium Charge"],
     "Penalty EGP": billing["Penalty"],
+    "Penalty Waived EGP": billing["Penalty Waived"],
     "Bonus EGP": billing["Bonus"],
     "Discount EGP": billing["Discount"],
     "Loyalty Discount EGP": billing["Loyalty Discount"],
@@ -2328,6 +2337,7 @@ with tab2:
         "Component": [
             "Premium Charge",
             "Penalty",
+            "Penalty Waived",
             "Bonus",
             "Discount",
             "Loyalty Discount",
@@ -2336,6 +2346,7 @@ with tab2:
         "EGP": [
             billing["Premium Charge"],
             billing["Penalty"],
+            billing["Penalty Waived"],
             billing["Bonus"],
             billing["Discount"],
             billing["Loyalty Discount"],
@@ -2488,9 +2499,9 @@ with tab4:
 st.divider()
 st.header("Final SCADA Decision Summary")
 
-if grid_stress and peak_event and achieved_reduction_percent < mandatory_reduction_percent:
+if grid_stress and peak_event and achieved_reduction_percent < effective_mandatory_reduction_percent:
     st.error(
-        "Final Decision: The user did not satisfy the minimum physical grid protection requirement. "
+        "Final Decision: The user did not satisfy the effective minimum physical grid protection requirement. "
         "The company may apply enforcement, restriction, or blocking logic in this simulation."
     )
 elif refuse_disconnect and grid_stress and peak_event:
@@ -2498,7 +2509,7 @@ elif refuse_disconnect and grid_stress and peak_event:
         "Final Decision: User preserved comfort and refused disconnection. "
         "Premium pricing is applied, but grid protection may still override if stress continues."
     )
-elif achieved_reduction_percent >= mandatory_reduction_percent and grid_stress and peak_event:
+elif achieved_reduction_percent >= effective_mandatory_reduction_percent and grid_stress and peak_event:
     st.success(
         "Final Decision: User supported the grid by reducing enough load. "
         "Discount or positive reliability score can be applied."
