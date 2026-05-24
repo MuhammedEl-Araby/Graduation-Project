@@ -61,7 +61,7 @@ components.html(
 
 
 # =========================================================
-# IMAGE LOADER
+# SAFE IMAGE LOADER
 # =========================================================
 
 def get_base64_image(image_path):
@@ -328,7 +328,7 @@ if "company_force_fair_settlement" not in st.session_state:
 # AC OVERLAY POSITIONS - FIXED VERSION
 # =========================================================
 
-AC_POSITION_VERSION = "v6_fixed_user_pattern_ac6_ac5_ac2_ac3_ac1_ac4_847x658"
+AC_POSITION_VERSION = "v7_fixed_user_pattern_ac6_ac5_ac2_ac3_ac1_ac4_847x658"
 
 DEFAULT_AC_OVERLAY_POSITIONS = {
     # Required apartment pattern:
@@ -339,7 +339,7 @@ DEFAULT_AC_OVERLAY_POSITIONS = {
     #
     # AC4
     #
-    # O/X positions are large and shifted away from AutoCAD text.
+    # Coordinates are near red AC symbols and shifted away from AutoCAD text.
     "AC 6": {"x": 132, "y": 112, "label_x": 132, "label_y": 58},
     "AC 5": {"x": 584, "y": 125, "label_x": 584, "label_y": 72},
     "AC 2": {"x": 805, "y": 174, "label_x": 790, "label_y": 118},
@@ -509,6 +509,7 @@ def predict_historical_baseline(model, input_df):
     row = input_df.iloc[0].astype(float)
 
     extreme_score = 0
+
     if row["lamps"] > 300:
         extreme_score += 1
     if row["acs"] > 80:
@@ -1351,6 +1352,18 @@ The simulator uses Random Forest plus engineering-style calculation.
 This prevents hidden caps and makes sure every entered number contributes.
 
 </div>
+
+<div class="manual-box">
+
+## MAE and R²
+
+MAE means Mean Absolute Error.
+
+R² means Coefficient of Determination.
+
+Higher R² and lower MAE usually mean better model performance.
+
+</div>
     """, unsafe_allow_html=True)
 
     st.subheader("Synthetic Dataset Preview")
@@ -1917,8 +1930,6 @@ forced_fair_settlement_active = (
     and peak_event
     and selected_surplus > 0
 )
-
-access_denied_above_baseline = forced_fair_settlement_active
 
 timer_should_run = (
     grid_stress
@@ -2505,7 +2516,7 @@ else:
 # =========================================================
 
 st.divider()
-st.headerion Summary")
+st.header("Final SCADA Decision Summary")
 
 if forced_fair_settlement_active:
     st.error(
