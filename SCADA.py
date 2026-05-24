@@ -11,6 +11,7 @@ from scipy.stats import norm
 from PIL import Image, ImageDraw, ImageFont
 import base64
 import os
+import time
 
 
 # =========================================================
@@ -60,7 +61,7 @@ components.html(
 
 
 # =========================================================
-# SAFE IMAGE LOADER
+# IMAGE LOADER
 # =========================================================
 
 def get_base64_image(image_path):
@@ -174,11 +175,6 @@ LOYALTY_DISCOUNT_RATE = 0.08
 
 LOW_BASELINE_THRESHOLD_KWH = 2.0
 LOW_BASELINE_MAX_REDUCTION_PERCENT = 10
-
-
-# =========================================================
-# LOAD CATEGORY OPTIONS
-# =========================================================
 
 LOAD_CATEGORY_OPTIONS = [
     "Critical / Never Disconnect",
@@ -321,15 +317,21 @@ if "ac_unit_states" not in st.session_state:
         "AC 6": True
     }
 
+if "deadline_started_at" not in st.session_state:
+    st.session_state.deadline_started_at = None
+
+if "company_force_fair_settlement" not in st.session_state:
+    st.session_state.company_force_fair_settlement = False
+
 
 # =========================================================
-# AC OVERLAY POSITIONS - FORCE CORRECT VERSION
+# AC OVERLAY POSITIONS - FIXED VERSION
 # =========================================================
 
-AC_POSITION_VERSION = "v5_user_pattern_ac6_ac5_ac2_ac3_ac1_ac4_847x658"
+AC_POSITION_VERSION = "v6_fixed_user_pattern_ac6_ac5_ac2_ac3_ac1_ac4_847x658"
 
 DEFAULT_AC_OVERLAY_POSITIONS = {
-    # User pattern:
+    # Required apartment pattern:
     #
     # AC6                  AC5                    AC2
     #
@@ -337,8 +339,7 @@ DEFAULT_AC_OVERLAY_POSITIONS = {
     #
     # AC4
     #
-    # Coordinates are placed near the red AC units, but shifted away
-    # from yellow/cyan AutoCAD text so the large O/X remains readable.
+    # O/X positions are large and shifted away from AutoCAD text.
     "AC 6": {"x": 132, "y": 112, "label_x": 132, "label_y": 58},
     "AC 5": {"x": 584, "y": 125, "label_x": 584, "label_y": 72},
     "AC 2": {"x": 805, "y": 174, "label_x": 790, "label_y": 118},
@@ -383,10 +384,6 @@ def ensure_appliance_columns(df):
         if col not in df.columns:
             df[col] = default
 
-    # Convert older checkbox-based configs into one category if old columns exist.
-    if "Load Category" not in df.columns:
-        df["Load Category"] = "Normal Load"
-
     valid_categories = set(LOAD_CATEGORY_OPTIONS)
     df["Load Category"] = df["Load Category"].apply(
         lambda x: x if x in valid_categories else "Normal Load"
@@ -395,7 +392,9 @@ def ensure_appliance_columns(df):
     return df[list(defaults.keys())]
 
 
-st.session_state.appliance_config = ensure_appliance_columns(st.session_state.appliance_config)
+st.session_state.appliance_config = ensure_appliance_columns(
+    st.session_state.appliance_config
+)
 
 
 # =========================================================
@@ -485,7 +484,7 @@ std_usage = training_df["historical_baseline_kwh"].std()
 
 
 # =========================================================
-# HYBRID BASELINE CALCULATION - NO LIMITS
+# HYBRID BASELINE CALCULATION
 # =========================================================
 
 def calculate_engineering_baseline(input_df):
@@ -534,7 +533,7 @@ def predict_historical_baseline(model, input_df):
 
 
 # =========================================================
-# HOUSEHOLD INTERPRETATION - NO LIMITS
+# HOUSEHOLD INPUT
 # =========================================================
 
 def describe_household_pattern(lamps, acs, washing, heavy, occupants, size):
@@ -563,13 +562,6 @@ def describe_household_pattern(lamps, acs, washing, heavy, occupants, size):
     if occupants >= 8 and size <= 100:
         messages.append(
             "Occupancy is dense for the entered area, but this can be valid for shared accommodation. The full occupant number is calculated."
-        )
-
-    total_equipment = lamps + acs + washing + heavy
-
-    if total_equipment / max(size, 1) > 0.5:
-        messages.append(
-            "Overall equipment density is high. This is treated as a valid operating scenario, not an input error."
         )
 
     if not messages:
@@ -641,7 +633,7 @@ def household_input(title, default_lamps, default_acs, default_washing,
 
 
 # =========================================================
-# PRIORITY EXPLANATION HELPERS
+# PRIORITY HELPERS
 # =========================================================
 
 def priority_meaning(priority_value):
@@ -675,20 +667,7 @@ def add_priority_meaning_columns(df):
     return df
 
 
-# =========================================================
-# LOAD CATEGORY PRIORITY LOGIC
-# =========================================================
-
 def apply_load_category_priority_rules(appliance_df):
-    """
-    One load category only.
-
-    Priority direction:
-    Lower number = disconnect earlier.
-    Higher number = preserve longer.
-    999 = protected / never disconnect.
-    """
-
     df = ensure_appliance_columns(appliance_df)
 
     for idx, row in df.iterrows():
@@ -789,12 +768,6 @@ def sync_ac_quantity_with_real_life_page():
 
 
 def apply_household_counts_to_appliance_config(base_config, household_df):
-    """
-    Optional SCADA linkage:
-    Makes the smart meter load table reflect the selected household input.
-    This lets forced settlement visibly reduce washing/heavy/AC/lights counts.
-    """
-
     df = ensure_appliance_columns(base_config)
     row = household_df.iloc[0]
 
@@ -929,7 +902,9 @@ def billing_engine(
     refused_disconnect,
     achieved_reduction_percent,
     mandatory_reduction_percent,
-    fair_conditions
+    fair_conditions,
+    deadline_penalty_active,
+    forced_fair_settlement_active
 ):
     premium_usage = max(final_usage - baseline, 0)
     normal_usage = min(final_usage, baseline)
@@ -938,6 +913,7 @@ def billing_engine(
 
     bonus = 0
     penalty = 0
+    timer_penalty = 0
     premium_charge = 0
     discount = 0
     loyalty_discount = 0
@@ -971,6 +947,7 @@ def billing_engine(
     penalty_should_apply = (
         grid_stress
         and achieved_reduction_percent < mandatory_reduction_percent
+        and not forced_fair_settlement_active
     )
 
     if (
@@ -995,6 +972,11 @@ def billing_engine(
 
         bill += penalty
 
+    if deadline_penalty_active and not forced_fair_settlement_active:
+        timer_penalty = final_usage * 0.25
+        bill += timer_penalty
+        status.append("Deadline penalty applied because the user refused or delayed response after the timer expired.")
+
     if (
         fair_conditions["grid_support_discount"]
         and grid_stress
@@ -1016,9 +998,12 @@ def billing_engine(
         discount += loyalty_discount
         status.append("Loyalty discount applied because usage stayed at or below historical baseline during peak stress.")
 
-    if refused_disconnect and grid_stress:
+    if refused_disconnect and grid_stress and not forced_fair_settlement_active:
         if fair_conditions["customer_autonomy"]:
-            status.append("User used manual override. Premium pricing or emergency enforcement may apply depending on physical grid stress.")
+            status.append("User used manual override. Timer, premium pricing, or emergency enforcement may apply.")
+
+    if forced_fair_settlement_active:
+        status.append("Forced fair settlement stabilized the line. Timer and delay penalty are disabled.")
 
     if not status:
         status.append("Normal billing condition.")
@@ -1028,6 +1013,7 @@ def billing_engine(
         "Premium Usage kWh": premium_usage,
         "Premium Charge": premium_charge,
         "Penalty": penalty,
+        "Timer Penalty": timer_penalty,
         "Penalty Waived": penalty_waived,
         "Bonus": bonus,
         "Discount": discount,
@@ -1035,6 +1021,79 @@ def billing_engine(
         "Final Bill": bill,
         "Status": " | ".join(status)
     }
+
+
+# =========================================================
+# TIMER ENGINE
+# =========================================================
+
+def deadline_timer_engine(timer_should_run, deadline_minutes, force_settlement_active):
+    now = time.time()
+
+    if force_settlement_active:
+        st.session_state.deadline_started_at = None
+        return False, "Timer disabled because forced fair settlement is active."
+
+    if not timer_should_run:
+        st.session_state.deadline_started_at = None
+        return False, "Timer inactive."
+
+    if st.session_state.deadline_started_at is None:
+        st.session_state.deadline_started_at = now
+
+    deadline_seconds = max(deadline_minutes * 60, 1)
+    elapsed = now - st.session_state.deadline_started_at
+    remaining = max(deadline_seconds - elapsed, 0)
+
+    expired = remaining <= 0
+
+    end_timestamp_ms = int((st.session_state.deadline_started_at + deadline_seconds) * 1000)
+
+    components.html(
+        f"""
+        <div style="
+            padding:14px;
+            border-radius:14px;
+            border:1px solid rgba(255,255,255,0.25);
+            background:rgba(0,0,0,0.45);
+            font-family:Arial;
+            color:white;
+            font-size:20px;">
+            <b>Response Deadline Timer:</b>
+            <span id="deadline_timer" style="color:#00ffff;font-weight:bold;"></span>
+        </div>
+
+        <script>
+        const endTime = {end_timestamp_ms};
+
+        function updateTimer() {{
+            const now = Date.now();
+            let diff = Math.max(0, endTime - now);
+            let totalSeconds = Math.floor(diff / 1000);
+            let minutes = Math.floor(totalSeconds / 60);
+            let seconds = totalSeconds % 60;
+
+            const text = minutes.toString().padStart(2, '0') + ":" + seconds.toString().padStart(2, '0');
+            document.getElementById("deadline_timer").innerText = text;
+
+            if (diff <= 0) {{
+                document.getElementById("deadline_timer").innerText = "EXPIRED - Penalty/Enforcement Active";
+                document.getElementById("deadline_timer").style.color = "red";
+                setTimeout(() => window.parent.location.reload(), 1200);
+            }}
+        }}
+
+        updateTimer();
+        setInterval(updateTimer, 1000);
+        </script>
+        """,
+        height=90
+    )
+
+    if expired:
+        return True, "Timer expired. Penalty/enforcement is active."
+    else:
+        return False, f"Timer running. Remaining seconds: {int(remaining)}"
 
 
 # =========================================================
@@ -1198,14 +1257,6 @@ with st.sidebar:
     st.write(f"Loyalty baseline discount: **{int(LOYALTY_DISCOUNT_RATE * 100)}%**")
     st.write(f"Growth bonus: **{int(BONUS_RATE * 100)}%**")
 
-    st.divider()
-
-    if os.path.exists("Dr.jpg"):
-        st.image("Dr.jpg")
-
-    st.header("Dynamic Pricing Simulator")
-    st.write("Supervised by: Dr. Alaa Hamam")
-
 
 # =========================================================
 # HOW TO USE PAGE
@@ -1220,7 +1271,7 @@ if page == "How To Use":
 
 ## Priority Direction
 
-The priority number is a **load shedding order**, not an importance score.
+The priority number is a load-shedding order.
 
 - **1** means disconnect first.
 - **2** means disconnect early.
@@ -1232,43 +1283,28 @@ The priority number is a **load shedding order**, not an importance score.
 
 <div class="manual-box">
 
-## Load Category
+## Force Fair Settlement
 
-Each appliance has one category only:
+The last resort settlement button is stronger than user refusal.
 
-- Critical / Never Disconnect
-- Shed First
-- Luxury Load
-- Normal Load
-- Comfort Load
+If it is ON:
 
-This is clearer than allowing many checkboxes at the same time.
-
-</div>
-
-<div class="manual-box">
-
-## Forced Fair Settlement
-
-At the end of the SCADA page, the company can activate a last-resort fair settlement button.
-
-If a user is within their own baseline, nothing is forced.
-
-If a user exceeds their own baseline during real line stress, the system forces high loads down first.
+- A user within their own baseline is protected.
+- A user above their own baseline is denied access above the fair limit.
+- Heavy and luxury loads are shed first.
+- Timer is disabled because the system immediately acts.
 
 </div>
 
 <div class="manual-box">
 
-## AC Real Life Simulation
+## Timer
 
-The AC pattern follows:
+The timer runs only when the user refuses or delays during real stress.
 
-AC6 — AC5 — AC2  
-AC3 — AC1  
-AC4
+If the timer expires, penalty/enforcement activates.
 
-The red AC symbols are marked with large O/X indicators.
+If forced fair settlement is ON, the timer stops because the company already corrected the line stress.
 
 </div>
     """, unsafe_allow_html=True)
@@ -1289,7 +1325,7 @@ if page == "AI & Model Details":
 
 ## Dataset
 
-The dataset is synthetic and generated inside the program for training and demonstration.
+The dataset is synthetic and generated inside the program.
 
 Features:
 
@@ -1310,24 +1346,9 @@ Output:
 
 ## Hybrid Baseline Logic
 
-The simulator uses both:
-
-- Random Forest prediction
-- Engineering-style calculation
+The simulator uses Random Forest plus engineering-style calculation.
 
 This prevents hidden caps and makes sure every entered number contributes.
-
-</div>
-
-<div class="manual-box">
-
-## MAE and R²
-
-MAE means Mean Absolute Error.
-
-R² means Coefficient of Determination.
-
-Higher R² and lower MAE usually mean better model performance.
 
 </div>
     """, unsafe_allow_html=True)
@@ -1391,9 +1412,7 @@ if page == "Real Life Simulation":
 
     st.title("Real Life Simulation")
 
-    st.warning(
-        "Put the HVAC image in the project folder with the exact name ACs.png."
-    )
+    st.warning("Put the HVAC image in the project folder with the exact name ACs.png.")
 
     st.markdown("""
 <div class="scada-card">
@@ -1429,32 +1448,23 @@ Pattern: AC6 — AC5 — AC2 / AC3 — AC1 / AC4
     m2.metric("Disconnected ACs", disconnected_ac_count)
     m3.metric("Synced AC Quantity", active_ac_count)
 
-    st.divider()
-
     image_path = "ACs.png"
 
     if not os.path.exists(image_path):
-        st.error(
-            "ACs.png was not found. Add ACs.png to the same folder as this Streamlit file, then rerun the app."
-        )
+        st.error("ACs.png was not found.")
         st.stop()
 
     show_added_ac_labels = st.checkbox(
         "Show extra AC labels on image",
-        value=False,
-        help="The AutoCAD image already has AC numbers. Keep this off unless you need extra labels."
+        value=False
     )
 
     if st.button("Reset AC positions to corrected apartment pattern"):
         st.session_state.ac_overlay_positions = DEFAULT_AC_OVERLAY_POSITIONS.copy()
         st.session_state.ac_position_version = AC_POSITION_VERSION
-        st.success("AC positions were reset to the corrected pattern.")
+        st.success("AC positions were reset.")
 
-    with st.expander("Edit X/O and AC Number Positions on the Plan"):
-        st.info(
-            "Default coordinates follow your pattern: AC6, AC5, AC2 on top; AC3 and AC1 in the middle; AC4 below."
-        )
-
+    with st.expander("Edit X/O and AC Number Positions"):
         position_rows = []
 
         for ac_name, pos in st.session_state.ac_overlay_positions.items():
@@ -1476,8 +1486,8 @@ Pattern: AC6 — AC5 — AC2 / AC3 — AC1 / AC4
                 "AC": st.column_config.TextColumn("AC", disabled=True),
                 "x": st.column_config.NumberColumn("Symbol X", step=1),
                 "y": st.column_config.NumberColumn("Symbol Y", step=1),
-                "label_x": st.column_config.NumberColumn("AC Number Label X", step=1),
-                "label_y": st.column_config.NumberColumn("AC Number Label Y", step=1)
+                "label_x": st.column_config.NumberColumn("Label X", step=1),
+                "label_y": st.column_config.NumberColumn("Label Y", step=1)
             }
         )
 
@@ -1517,10 +1527,6 @@ Pattern: AC6 — AC5 — AC2 / AC3 — AC1 / AC4
     st.subheader("Real Life Simulation Status Table")
     st.dataframe(status_df, use_container_width=True)
 
-    st.success(
-        "The AC status is synchronized with the ACs row in the Smart Meter Override Page."
-    )
-
     st.stop()
 
 
@@ -1531,10 +1537,6 @@ Pattern: AC6 — AC5 — AC2 / AC3 — AC1 / AC4
 if page == "Smart Meter Override Page":
 
     st.title("Smart Meter Override Page")
-
-    st.warning(
-        "This page lets the client manually override smart meter rules."
-    )
 
     st.info(
         "Priority direction: lower number means disconnect earlier. "
@@ -1589,14 +1591,7 @@ if page == "Smart Meter Override Page":
             "Load Category": st.column_config.SelectboxColumn(
                 "Load Category",
                 options=LOAD_CATEGORY_OPTIONS,
-                help=(
-                    "Choose only one category. "
-                    "Critical = never disconnect. "
-                    "Shed First = disconnect earliest. "
-                    "Luxury = disconnect early. "
-                    "Normal = normal order. "
-                    "Comfort = preserve longer."
-                )
+                help="Choose only one category."
             ),
             "Allow Company Emergency Control": st.column_config.CheckboxColumn("Allow Company Emergency Control"),
             "Preserve Minimum Units": st.column_config.NumberColumn("Preserve Minimum Units", min_value=0, step=1),
@@ -1656,10 +1651,6 @@ if page == "Smart Meter Override Page":
 
     st.plotly_chart(fig, use_container_width=True)
 
-    st.success(
-        "Smart meter override configuration has been saved."
-    )
-
     st.stop()
 
 
@@ -1679,12 +1670,11 @@ st.markdown("""
 <div class="big-status">Integrated Operating Scenario</div>
 This dashboard combines baseline calculation, dynamic tariffs, compatible fairness rules,
 smart meter override, priority-based load shedding, forced fair settlement,
-and premium uninterrupted consumption pricing.
+deadline timer, and premium uninterrupted consumption pricing.
 </div>
 """, unsafe_allow_html=True)
 
 
-# Read last-resort checkbox state early so it affects calculations after rerun.
 company_force_fair_settlement = st.session_state.get(
     "company_force_fair_settlement",
     False
@@ -1700,67 +1690,22 @@ st.header("SCADA Fairness & Protection Conditions")
 fc1, fc2, fc3 = st.columns(3)
 
 with fc1:
-    condition_district_reduction = st.checkbox(
-        "District-wide load reduction",
-        value=True
-    )
-
-    condition_historical_baseline = st.checkbox(
-        "Historical baseline protection",
-        value=True
-    )
-
-    condition_marginal_premium = st.checkbox(
-        "Premium only above own baseline",
-        value=True
-    )
-
-    condition_low_baseline_protection = st.checkbox(
-        "Low-baseline customer protection",
-        value=True
-    )
+    condition_district_reduction = st.checkbox("District-wide load reduction", value=True)
+    condition_historical_baseline = st.checkbox("Historical baseline protection", value=True)
+    condition_marginal_premium = st.checkbox("Premium only above own baseline", value=True)
+    condition_low_baseline_protection = st.checkbox("Low-baseline customer protection", value=True)
 
 with fc2:
-    condition_customer_autonomy = st.checkbox(
-        "Customer autonomy / manual override",
-        value=True
-    )
-
-    condition_critical_load_protection = st.checkbox(
-        "Critical loads never disconnect",
-        value=True
-    )
-
-    condition_minimum_service = st.checkbox(
-        "Minimum service preservation",
-        value=True
-    )
-
-    condition_emergency_enforcement = st.checkbox(
-        "Physical-grid emergency enforcement",
-        value=True
-    )
+    condition_customer_autonomy = st.checkbox("Customer autonomy / manual override", value=True)
+    condition_critical_load_protection = st.checkbox("Critical loads never disconnect", value=True)
+    condition_minimum_service = st.checkbox("Minimum service preservation", value=True)
+    condition_emergency_enforcement = st.checkbox("Physical-grid emergency enforcement", value=True)
 
 with fc3:
-    condition_grid_support_discount = st.checkbox(
-        "Grid support discount",
-        value=True
-    )
-
-    condition_loyalty_discount = st.checkbox(
-        "Loyalty discount below baseline",
-        value=True
-    )
-
-    condition_progressive_penalty = st.checkbox(
-        "Progressive penalty by shortfall",
-        value=True
-    )
-
-    condition_growth_bonus = st.checkbox(
-        "Company growth bonus when grid is stable",
-        value=False
-    )
+    condition_grid_support_discount = st.checkbox("Grid support discount", value=True)
+    condition_loyalty_discount = st.checkbox("Loyalty discount below baseline", value=True)
+    condition_progressive_penalty = st.checkbox("Progressive penalty by shortfall", value=True)
+    condition_growth_bonus = st.checkbox("Company growth bonus when grid is stable", value=False)
 
 fair_conditions = {
     "district_reduction": condition_district_reduction,
@@ -1928,35 +1873,26 @@ else:
 
 
 # =========================================================
-# FAIR SETTLEMENT CALCULATION FOR BOTH USERS
+# FAIR SETTLEMENT BOTH USERS
 # =========================================================
 
 settlement_rows = []
 
-users_for_settlement = [
-    {
-        "Client": "Person A",
-        "Baseline": baseline_a,
-        "Requested Usage": requested_usage_a
-    },
-    {
-        "Client": "Person B",
-        "Baseline": baseline_b,
-        "Requested Usage": requested_usage_b
-    }
-]
+for client_name, baseline_value, requested_value in [
+    ("Person A", baseline_a, requested_usage_a),
+    ("Person B", baseline_b, requested_usage_b)
+]:
+    surplus = max(requested_value - baseline_value, 0)
 
-for user in users_for_settlement:
-    surplus = max(user["Requested Usage"] - user["Baseline"], 0)
-    forced_percent = 0
-
-    if user["Requested Usage"] > 0:
-        forced_percent = (surplus / user["Requested Usage"]) * 100
+    if requested_value > 0:
+        forced_percent = (surplus / requested_value) * 100
+    else:
+        forced_percent = 0
 
     settlement_rows.append({
-        "Client": user["Client"],
-        "Baseline kWh": user["Baseline"],
-        "Requested kWh": user["Requested Usage"],
+        "Client": client_name,
+        "Baseline kWh": baseline_value,
+        "Requested kWh": requested_value,
         "Surplus Above Baseline kWh": surplus,
         "Forced Fair Reduction %": forced_percent,
         "Settlement Status": "High load - force reduction" if surplus > 0 else "Within baseline - no forced reduction"
@@ -1966,17 +1902,52 @@ settlement_df = pd.DataFrame(settlement_rows)
 
 
 # =========================================================
-# EFFECTIVE FAIR REDUCTION LOGIC
+# TIMER AND FORCE SETTLEMENT LOGIC
 # =========================================================
 
 policy_mode = st.session_state.selected_user_policy
 refuse_disconnect = st.session_state.refuse_disconnect
 climate_mode = st.session_state.climate_mode
 
+selected_surplus = max(requested_usage - selected_baseline, 0)
+
+forced_fair_settlement_active = (
+    company_force_fair_settlement
+    and grid_stress
+    and peak_event
+    and selected_surplus > 0
+)
+
+access_denied_above_baseline = forced_fair_settlement_active
+
+timer_should_run = (
+    grid_stress
+    and peak_event
+    and not forced_fair_settlement_active
+    and (
+        refuse_disconnect
+        or requested_usage > selected_baseline
+        or user_failed_to_respond
+    )
+)
+
+deadline_penalty_active, timer_status = deadline_timer_engine(
+    timer_should_run=timer_should_run,
+    deadline_minutes=response_deadline_minutes,
+    force_settlement_active=forced_fair_settlement_active
+)
+
+if deadline_penalty_active:
+    user_failed_to_respond = True
+
+
+# =========================================================
+# EFFECTIVE REDUCTION LOGIC
+# =========================================================
+
 effective_voluntary_reduction_percent = voluntary_reduction_percent
 effective_mandatory_reduction_percent = mandatory_reduction_percent
 
-forced_fair_settlement_active = False
 forced_fair_settlement_reason = "Not active"
 
 if (
@@ -1997,16 +1968,12 @@ if not fair_conditions["district_reduction"]:
     effective_voluntary_reduction_percent = 0
 
 if company_force_fair_settlement and grid_stress and peak_event:
-    selected_surplus = max(requested_usage - selected_baseline, 0)
-
     if selected_surplus <= 0:
         effective_voluntary_reduction_percent = 0
         effective_mandatory_reduction_percent = 0
-        forced_fair_settlement_active = False
         forced_fair_settlement_reason = (
             "Selected customer is within own historical baseline. No forced disconnection required."
         )
-
     else:
         forced_reduction_percent = (selected_surplus / max(requested_usage, 0.001)) * 100
 
@@ -2020,10 +1987,9 @@ if company_force_fair_settlement and grid_stress and peak_event:
             forced_reduction_percent
         )
 
-        forced_fair_settlement_active = True
         forced_fair_settlement_reason = (
-            f"Selected customer exceeds own baseline by {selected_surplus:.2f} kWh. "
-            f"Forced fair reduction target is {forced_reduction_percent:.2f}%."
+            f"ACCESS DENIED ABOVE BASELINE. Selected customer exceeds own baseline by {selected_surplus:.2f} kWh. "
+            f"Company forced fair reduction target is {forced_reduction_percent:.2f}%."
         )
 
 
@@ -2070,7 +2036,12 @@ if original_load_kw > 0:
 else:
     usage_ratio = 1
 
-final_usage = requested_usage * usage_ratio
+final_usage_raw = requested_usage * usage_ratio
+
+if forced_fair_settlement_active:
+    final_usage = min(final_usage_raw, selected_baseline)
+else:
+    final_usage = final_usage_raw
 
 billing = billing_engine(
     baseline=selected_baseline,
@@ -2081,7 +2052,9 @@ billing = billing_engine(
     refused_disconnect=refuse_disconnect,
     achieved_reduction_percent=achieved_reduction_percent,
     mandatory_reduction_percent=effective_mandatory_reduction_percent,
-    fair_conditions=fair_conditions
+    fair_conditions=fair_conditions,
+    deadline_penalty_active=deadline_penalty_active,
+    forced_fair_settlement_active=forced_fair_settlement_active
 )
 
 
@@ -2106,12 +2079,21 @@ e2.metric("Effective Mandatory Reduction", f"{effective_mandatory_reduction_perc
 
 e3, e4 = st.columns(2)
 e3.metric("Forced Fair Settlement", "Active" if forced_fair_settlement_active else "Inactive")
-e4.metric("Fair Settlement Rule", "Above baseline" if forced_fair_settlement_active else "Within baseline / Not forced")
+e4.metric("Timer Penalty", "Active" if deadline_penalty_active else "Inactive")
+
+if forced_fair_settlement_active:
+    st.error(forced_fair_settlement_reason)
+    st.error("ACCESS DENIED: The customer cannot exceed the fair baseline limit during physical line stress.")
+elif company_force_fair_settlement and selected_surplus <= 0:
+    st.success("Force settlement is ON, but this customer is within baseline. No forced action is needed.")
+
+if timer_should_run and not deadline_penalty_active:
+    st.warning("Timer is running because the user is delaying, refusing, or exceeding baseline during stress.")
+
+if deadline_penalty_active:
+    st.error("Deadline expired. Penalty/enforcement is now active.")
 
 st.info(enforcement_status)
-
-if company_force_fair_settlement:
-    st.warning(forced_fair_settlement_reason)
 
 
 # =========================================================
@@ -2176,19 +2158,19 @@ condition_rows.append({
 })
 
 condition_rows.append({
-    "Condition": "Marginal premium above baseline",
-    "Active": fair_conditions["marginal_premium"],
-    "Rule": "Premium applies only above own baseline",
-    "Result": f"Premium usage {billing['Premium Usage kWh']:.2f} kWh",
-    "Status": "Premium applied" if billing["Premium Charge"] > 0 else "No premium"
+    "Condition": "Company forced fair settlement",
+    "Active": company_force_fair_settlement,
+    "Rule": "Users within baseline are protected; users above baseline are forced down immediately",
+    "Result": forced_fair_settlement_reason,
+    "Status": "Access denied above baseline" if forced_fair_settlement_active else "No forced reduction"
 })
 
 condition_rows.append({
-    "Condition": "Company forced fair settlement",
-    "Active": company_force_fair_settlement,
-    "Rule": "Users within baseline are protected; users above baseline are forced down",
-    "Result": forced_fair_settlement_reason,
-    "Status": "Forced reduction active" if forced_fair_settlement_active else "No forced reduction"
+    "Condition": "Response deadline timer",
+    "Active": timer_should_run,
+    "Rule": "Timer runs only when user delays/refuses and force settlement is OFF",
+    "Result": timer_status,
+    "Status": "Penalty active" if deadline_penalty_active else "No penalty from timer"
 })
 
 condition_rows.append({
@@ -2235,6 +2217,7 @@ billing_df = pd.DataFrame([{
     "Premium Usage kWh": billing["Premium Usage kWh"],
     "Premium Charge EGP": billing["Premium Charge"],
     "Penalty EGP": billing["Penalty"],
+    "Timer Penalty EGP": billing["Timer Penalty"],
     "Penalty Waived EGP": billing["Penalty Waived"],
     "Bonus EGP": billing["Bonus"],
     "Discount EGP": billing["Discount"],
@@ -2325,6 +2308,7 @@ with tab2:
         "Component": [
             "Premium Charge",
             "Penalty",
+            "Timer Penalty",
             "Penalty Waived",
             "Bonus",
             "Discount",
@@ -2334,6 +2318,7 @@ with tab2:
         "EGP": [
             billing["Premium Charge"],
             billing["Penalty"],
+            billing["Timer Penalty"],
             billing["Penalty Waived"],
             billing["Bonus"],
             billing["Discount"],
@@ -2482,7 +2467,7 @@ with tab4:
 
 
 # =========================================================
-# LAST RESORT FAIR SETTLEMENT CONTROL - END OF PAGE
+# LAST RESORT FORCE SETTLEMENT CONTROL
 # =========================================================
 
 st.divider()
@@ -2490,7 +2475,8 @@ st.header("Last Resort Company Fair Settlement Control")
 
 st.warning(
     "This is the final emergency fairness control. "
-    "When enabled, users within their own baseline are protected, while users exceeding their own baseline are forced to reduce high loads first."
+    "When enabled, the company overrides user refusal and premium payment during real stress. "
+    "Users within their own baseline are protected. Users above baseline are denied access above the fair limit."
 )
 
 st.checkbox(
@@ -2506,11 +2492,11 @@ st.checkbox(
 
 if company_force_fair_settlement:
     st.error(
-        "Forced fair settlement is currently ON. After changing this checkbox, the app reruns and updates the load shedding table immediately."
+        "Forced fair settlement is ON. Timer is disabled. Company has upper hand to protect physical line stress."
     )
 else:
     st.info(
-        "Forced fair settlement is currently OFF. Users can still rely on normal smart meter priority and premium pricing rules."
+        "Forced fair settlement is OFF. User refusal or pay-more behavior can trigger the response deadline timer."
     )
 
 
@@ -2519,23 +2505,26 @@ else:
 # =========================================================
 
 st.divider()
-st.header("Final SCADA Decision Summary")
+st.headerion Summary")
 
 if forced_fair_settlement_active:
     st.error(
-        "Final Decision: Company forced fair settlement was activated. "
-        "The selected customer exceeded their own historical baseline during real line stress, "
-        "so the system forced reduction using company priority even if the customer wanted to pay more."
+        "Final Decision: ACCESS DENIED ABOVE BASELINE. "
+        "The customer exceeded their own historical baseline during real line stress. "
+        "Company forced reduction was applied using company priority, overriding refusal and premium payment."
+    )
+elif deadline_penalty_active:
+    st.error(
+        "Final Decision: The response deadline expired. Penalty/enforcement is active because the user delayed or refused while stress remained."
     )
 elif grid_stress and peak_event and achieved_reduction_percent < effective_mandatory_reduction_percent:
     st.error(
-        "Final Decision: The user did not satisfy the effective minimum physical grid protection requirement. "
-        "The company may apply enforcement, restriction, or blocking logic in this simulation."
+        "Final Decision: The user did not satisfy the effective minimum physical grid protection requirement."
     )
 elif refuse_disconnect and grid_stress and peak_event:
     st.warning(
         "Final Decision: User preserved comfort and refused disconnection. "
-        "Premium pricing is applied, but grid protection may still override if stress continues."
+        "Premium pricing applies, but timer or emergency enforcement may still activate."
     )
 elif achieved_reduction_percent >= effective_mandatory_reduction_percent and grid_stress and peak_event:
     st.success(
