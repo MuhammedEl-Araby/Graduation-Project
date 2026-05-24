@@ -1425,8 +1425,6 @@ if page == "Real Life Simulation":
 
     st.title("Real Life Simulation")
 
-    st.warning("Put the HVAC image in the project folder with the exact name ACs.png.")
-
     st.markdown("""
 <div class="scada-card">
 <div class="big-status">HVAC Plan Live Overlay</div>
