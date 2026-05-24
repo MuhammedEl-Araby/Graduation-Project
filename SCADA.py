@@ -335,17 +335,23 @@ if "ac_unit_states" not in st.session_state:
     }
 
 if "ac_overlay_positions" not in st.session_state:
-    # Corrected for uploaded ACs.png.
-    # Image size: 847 x 658 px.
-    # x/y = center of red AC symbol.
-    # label_x/label_y = position of yellow AC number label.
+    # Corrected AC layout for uploaded ACs.png.
+    # Apartment pattern:
+    # AC6                  AC5                  AC2
+    #
+    # AC3                                      AC1
+    #
+    # AC4
+    #
+    # x/y = large X/O symbol position, placed near the red AC symbol but away from text.
+    # label_x/label_y = small added AC label, away from original AutoCAD text.
     st.session_state.ac_overlay_positions = {
-        "AC 1": {"x": 819, "y": 444, "label_x": 727, "label_y": 424},
-        "AC 2": {"x": 818, "y": 174, "label_x": 730, "label_y": 255},
-        "AC 3": {"x": 20,  "y": 408, "label_x": 79,  "label_y": 481},
-        "AC 4": {"x": 20,  "y": 546, "label_x": 78,  "label_y": 618},
-        "AC 5": {"x": 584, "y": 125, "label_x": 493, "label_y": 207},
-        "AC 6": {"x": 132, "y": 112, "label_x": 213, "label_y": 194},
+        "AC 6": {"x": 158, "y": 108, "label_x": 170, "label_y": 62},
+        "AC 5": {"x": 620, "y": 126, "label_x": 640, "label_y": 82},
+        "AC 2": {"x": 785, "y": 174, "label_x": 790, "label_y": 125},
+        "AC 3": {"x": 58,  "y": 408, "label_x": 70,  "label_y": 350},
+        "AC 1": {"x": 780, "y": 448, "label_x": 760, "label_y": 500},
+        "AC 4": {"x": 58,  "y": 546, "label_x": 70,  "label_y": 505},
     }
 
 
@@ -635,6 +641,47 @@ def household_input(title, default_lamps, default_acs, default_washing,
         "occupants": occupants,
         "house_size": size
     }])
+
+
+# =========================================================
+# PRIORITY EXPLANATION HELPERS
+# =========================================================
+
+def priority_meaning(priority_value):
+    """
+    Lower number means disconnect earlier.
+    Higher number means preserve longer.
+    999 means protected / never disconnect.
+    """
+
+    try:
+        p = int(priority_value)
+    except Exception:
+        return "Unknown"
+
+    if p >= 999:
+        return "Protected - Never Disconnect"
+    elif p == 1:
+        return "1 - Disconnect First"
+    elif p == 2:
+        return "2 - Disconnect Early"
+    elif p == 3:
+        return "3 - Emergency Early"
+    elif p == 4:
+        return "4 - Normal Shedding"
+    elif p == 5:
+        return "5 - Preserve Longer"
+    elif p in [6, 7, 8, 9, 10]:
+        return f"{p} - Disconnect Late"
+    else:
+        return f"{p} - Custom Order"
+
+
+def add_priority_meaning_columns(df):
+    df = df.copy()
+    df["User Priority Meaning"] = df["User Priority"].apply(priority_meaning)
+    df["Company Priority Meaning"] = df["Company Priority"].apply(priority_meaning)
+    return df
 
 
 # =========================================================
@@ -1054,8 +1101,11 @@ def render_ac_plan_overlay(image_path, ac_states, positions):
     image = Image.open(image_path).convert("RGBA")
     draw = ImageDraw.Draw(image)
 
-    symbol_font = get_font(96)
-    label_font = get_font(28)
+    # Larger X/O symbols for clearer SCADA visibility.
+    symbol_font = get_font(118)
+
+    # Smaller label so it does not cover AutoCAD details.
+    label_font = get_font(24)
 
     for ac_name, is_on in ac_states.items():
         pos = positions.get(
@@ -1078,7 +1128,7 @@ def render_ac_plan_overlay(image_path, ac_states, positions):
             font=symbol_font,
             fill=color,
             outline_fill="black",
-            outline_width=9
+            outline_width=11
         )
 
         draw_label_box(
@@ -1170,13 +1220,29 @@ It combines:
 - Real-life HVAC visual simulation
 - Billing, penalty, premium, discount, and loyalty-discount calculation
 
-The system is not a real utility SCADA system. It is a safe simulation that demonstrates how a company could manage load during high demand or physical line stress.
+</div>
+
+<div class="manual-box">
+
+## 2. Priority Direction
+
+This simulator uses **load shedding priority**, not importance priority.
+
+Meaning:
+
+- **1** = disconnect first
+- **2** = disconnect early
+- **4** = normal shedding
+- **5** = preserve longer
+- **999** = protected / never disconnect
+
+So a lower number means the appliance disconnects earlier.
 
 </div>
 
 <div class="manual-box">
 
-## 2. Fairness Conditions
+## 3. Fairness Conditions
 
 The fairness conditions can work together.
 
@@ -1194,29 +1260,25 @@ You can activate:
 - Loyalty discount
 - Progressive penalty
 - Growth bonus
-
-This makes the simulation closer to a real smart-grid policy engine.
-
-</div>
-
-<div class="manual-box">
-
-## 3. Smart Meter Override Page
-
-Use checkboxes instead of priority numbers.
-
-- **Shed First** means disconnect early.
-- **Comfort Load** means preserve if possible.
-- **Luxury Load** means shed before comfort load.
-- **Critical Load** means never disconnect.
-- **Allow Company Emergency Control** means company can use this appliance during physical emergency.
-- **Preserve Minimum Units** protects a minimum number of units.
+- Company forced fair settlement
 
 </div>
 
 <div class="manual-box">
 
-## 4. Real Life Simulation
+## 4. Company Forced Fair Settlement
+
+If enabled, the company checks whether the user is causing the peak problem.
+
+- If the user is within their own historical baseline, no forced disconnection is applied.
+- If the user exceeds their own historical baseline during real line stress, the company forces reduction.
+- Premium payment and refusal do not override physical line protection.
+
+</div>
+
+<div class="manual-box">
+
+## 5. Real Life Simulation
 
 Place your HVAC image in the app folder with the exact name:
 
@@ -1228,16 +1290,6 @@ The page overlays:
 - Red **X** for disconnected AC
 
 The number of working ACs is synchronized with the AC row in the smart meter table.
-
-</div>
-
-<div class="manual-box">
-
-## 5. No Equipment Limits
-
-The simulator does not limit lamps, ACs, washing machines, heavy machines, occupants, or house size.
-
-Every number entered by the user is included in the calculation.
 
 </div>
     """, unsafe_allow_html=True)
@@ -1329,20 +1381,6 @@ R² means Coefficient of Determination.
 Gaussian randomness means normal-distribution noise.
 
 It is added because real electrical consumption is not perfectly fixed.
-
-</div>
-
-<div class="manual-box">
-
-## Confidential Baseline Idea
-
-In a real system, the customer-facing name should be:
-
-**Historical Consumption Baseline**
-
-or
-
-**Customer Historical Consumption Profile**
 
 </div>
     """, unsafe_allow_html=True)
@@ -1456,7 +1494,7 @@ Use the controls below to turn each AC ON or OFF. The image updates immediately.
 
     with st.expander("Edit X/O and AC Number Positions on the Plan"):
         st.info(
-            "Default coordinates are adjusted for the uploaded image size 847 x 658 px. "
+            "Default coordinates follow your apartment pattern: AC6, AC5, AC2 on top; AC3 and AC1 in the middle; AC4 below. "
             "Adjust x/y and label_x/label_y if needed."
         )
 
@@ -1500,7 +1538,7 @@ Use the controls below to turn each AC ON or OFF. The image updates immediately.
         positions=st.session_state.ac_overlay_positions
     )
 
-    center_left, center_main, center_right = st.columns([0.03, 0.94, 0.03])
+    center_left, center_main, center_right = st.columns([0.02, 0.96, 0.02])
 
     with center_main:
         st.image(
@@ -1556,6 +1594,11 @@ if page == "Smart Meter Override Page":
     - Whether the user refuses all automatic disconnections
     """)
 
+    st.info(
+        "Priority direction: lower number means disconnect earlier. "
+        "Higher number means preserve longer. 999 means protected and never disconnected."
+    )
+
     st.divider()
 
     col_a, col_b, col_c = st.columns(3)
@@ -1589,10 +1632,6 @@ if page == "Smart Meter Override Page":
             index=climate_options.index(st.session_state.climate_mode)
             if st.session_state.climate_mode in climate_options else 0
         )
-
-    st.info(
-        "The table uses checkboxes. Internal priority numbers are calculated automatically."
-    )
 
     st.subheader("Edit Appliance Status and SCADA Conditions")
 
@@ -1641,6 +1680,26 @@ if page == "Smart Meter Override Page":
         )
 
     st.session_state.appliance_config = apply_checkbox_priority_rules(edited_df)
+
+    priority_explanation_df = add_priority_meaning_columns(st.session_state.appliance_config)
+
+    st.subheader("Priority Meaning Summary")
+
+    st.dataframe(
+        priority_explanation_df[
+            [
+                "Appliance",
+                "Shed First",
+                "Comfort Load",
+                "Luxury Load",
+                "Critical Load",
+                "Allow Company Emergency Control",
+                "User Priority Meaning",
+                "Company Priority Meaning"
+            ]
+        ],
+        use_container_width=True
+    )
 
     st.divider()
 
@@ -1696,7 +1755,7 @@ st.markdown("""
 <div class="big-status">Integrated Operating Scenario</div>
 This dashboard combines historical baseline calculation, dynamic tariffs, compatible fairness conditions,
 manual smart meter override, priority-based load shedding, mandatory grid protection,
-customer autonomy, and premium uninterrupted consumption pricing.
+customer autonomy, forced fair settlement, and premium uninterrupted consumption pricing.
 </div>
 """, unsafe_allow_html=True)
 
@@ -1807,8 +1866,7 @@ fair_conditions = {
 }
 
 st.info(
-    "Active fairness rules are combined together. For example, district-wide reduction, historical baseline protection, "
-    "customer autonomy, low-baseline protection, and emergency enforcement can all work at the same time."
+    "Active fairness rules are combined together. A customer within their own baseline is treated differently from a customer exceeding their own fair limit."
 )
 
 
@@ -1868,6 +1926,16 @@ st.session_state.mandatory_reduction_percent = mandatory_reduction_percent
 user_failed_to_respond = st.checkbox(
     "User ignored repeated company requests until deadline expired",
     value=False
+)
+
+company_force_fair_settlement = st.checkbox(
+    "Company force fair settlement for all users causing line stress",
+    value=False,
+    help=(
+        "If enabled, users who stay within their own baseline are not disconnected. "
+        "Users who exceed their fair baseline during real stress are forced to reduce immediately, "
+        "even if they selected premium payment or refused disconnection."
+    )
 )
 
 if grid_stress and peak_event:
@@ -1975,6 +2043,13 @@ climate_mode = st.session_state.climate_mode
 effective_voluntary_reduction_percent = voluntary_reduction_percent
 effective_mandatory_reduction_percent = mandatory_reduction_percent
 
+forced_fair_settlement_active = False
+forced_fair_settlement_reason = "Not active"
+
+# ---------------------------------------------------------
+# Low-baseline protection
+# ---------------------------------------------------------
+
 if (
     fair_conditions["low_baseline_protection"]
     and selected_baseline <= LOW_BASELINE_THRESHOLD_KWH
@@ -1994,12 +2069,59 @@ if (
         f"the effective reduction request is capped at {LOW_BASELINE_MAX_REDUCTION_PERCENT}%."
     )
 
+# ---------------------------------------------------------
+# If district-wide reduction is disabled
+# ---------------------------------------------------------
+
 if not fair_conditions["district_reduction"]:
     effective_voluntary_reduction_percent = 0
     st.info(
         "District-wide load reduction is disabled. Voluntary reduction request is set to 0%, "
         "but emergency mandatory protection can still apply if enabled."
     )
+
+# ---------------------------------------------------------
+# Company force fair settlement
+# ---------------------------------------------------------
+
+if company_force_fair_settlement and grid_stress and peak_event:
+    if requested_usage <= selected_baseline:
+        effective_voluntary_reduction_percent = 0
+        effective_mandatory_reduction_percent = 0
+        forced_fair_settlement_active = False
+        forced_fair_settlement_reason = (
+            "Customer is within own historical baseline. No forced disconnection required."
+        )
+
+        st.success(
+            "Fair settlement: This customer is within their own historical baseline, "
+            "so the company does not force disconnection."
+        )
+
+    else:
+        surplus_usage = requested_usage - selected_baseline
+        forced_reduction_percent = (surplus_usage / max(requested_usage, 0.001)) * 100
+
+        effective_voluntary_reduction_percent = max(
+            effective_voluntary_reduction_percent,
+            forced_reduction_percent
+        )
+
+        effective_mandatory_reduction_percent = max(
+            effective_mandatory_reduction_percent,
+            forced_reduction_percent
+        )
+
+        forced_fair_settlement_active = True
+        forced_fair_settlement_reason = (
+            f"Customer exceeds own baseline by {surplus_usage:.2f} kWh. "
+            f"Forced fair reduction target is {forced_reduction_percent:.2f}%."
+        )
+
+        st.error(
+            "Company fair settlement is active: this customer exceeds their own historical baseline "
+            "during real line stress. The system will force reduction even if premium payment or refusal was selected."
+        )
 
 
 # =========================================================
@@ -2009,16 +2131,19 @@ if not fair_conditions["district_reduction"]:
 shed_df, original_load_kw, final_load_kw, achieved_reduction_percent, enforcement_status = smart_meter_shed_load(
     appliance_df=st.session_state.appliance_config,
     requested_reduction_percent=effective_voluntary_reduction_percent,
-    policy_mode=policy_mode,
-    refuse_disconnect=refuse_disconnect,
+    policy_mode="Company Priority" if forced_fair_settlement_active else policy_mode,
+    refuse_disconnect=False if forced_fair_settlement_active else refuse_disconnect,
     climate_mode=climate_mode,
     mandatory_minimum_percent=effective_mandatory_reduction_percent,
-    user_failed_to_respond=user_failed_to_respond,
+    user_failed_to_respond=True if forced_fair_settlement_active else user_failed_to_respond,
     enforcement_enabled=(
-        enforcement_enabled
-        and grid_stress
-        and peak_event
-        and fair_conditions["emergency_enforcement"]
+        forced_fair_settlement_active
+        or (
+            enforcement_enabled
+            and grid_stress
+            and peak_event
+            and fair_conditions["emergency_enforcement"]
+        )
     ),
     minimum_service_enabled=fair_conditions["minimum_service"]
 )
@@ -2062,6 +2187,19 @@ s5.metric("Final Bill", f"{billing['Final Bill']:.2f} EGP")
 e1, e2 = st.columns(2)
 e1.metric("Effective Voluntary Reduction", f"{effective_voluntary_reduction_percent:.2f}%")
 e2.metric("Effective Mandatory Reduction", f"{effective_mandatory_reduction_percent:.2f}%")
+
+e3, e4 = st.columns(2)
+e3.metric(
+    "Forced Fair Settlement",
+    "Active" if forced_fair_settlement_active else "Inactive"
+)
+e4.metric(
+    "Fair Settlement Rule",
+    "Above baseline" if forced_fair_settlement_active else "Within baseline / Not forced"
+)
+
+if company_force_fair_settlement:
+    st.info(forced_fair_settlement_reason)
 
 if achieved_reduction_percent < effective_mandatory_reduction_percent and grid_stress and peak_event:
     st.error("Grid Protection Warning: The effective mandatory reduction target was not achieved.")
@@ -2145,6 +2283,14 @@ condition_rows.append({
 })
 
 condition_rows.append({
+    "Condition": "Company forced fair settlement",
+    "Active": company_force_fair_settlement,
+    "Rule": "Do not disconnect users within own baseline; force users exceeding own baseline during line stress",
+    "Result": forced_fair_settlement_reason,
+    "Status": "Forced reduction active" if forced_fair_settlement_active else "No forced reduction"
+})
+
+condition_rows.append({
     "Condition": "Grid support discount",
     "Active": fair_conditions["grid_support_discount"],
     "Rule": f"Achieve at least {effective_mandatory_reduction_percent}% reduction",
@@ -2196,6 +2342,11 @@ if refuse_disconnect:
     st.error(
         "Client Policy: The user selected no disconnection. The system will apply premium convenience pricing. "
         "If the deadline expires during real stress, emergency enforcement may override the refusal."
+    )
+
+if forced_fair_settlement_active:
+    st.error(
+        "Forced Fair Settlement: Premium payment and refusal are ignored because this customer exceeds their own historical baseline during real line stress."
     )
 
 if new_company_growth_mode and not grid_stress:
@@ -2380,7 +2531,6 @@ with tab3:
     )
 
     y = norm.pdf(x, mean_usage, std_usage)
-
     user_y = norm.pdf(selected_baseline, mean_usage, std_usage)
 
     z_score = (selected_baseline - mean_usage) / std_usage
@@ -2452,7 +2602,27 @@ with tab3:
 
 
 with tab4:
-    priority_df = st.session_state.appliance_config.copy()
+    priority_df = add_priority_meaning_columns(st.session_state.appliance_config.copy())
+
+    st.subheader("Readable Priority Explanation")
+
+    st.info(
+        "Lower priority number means disconnect earlier. "
+        "Higher priority number means preserve longer. 999 means protected and never disconnected."
+    )
+
+    st.dataframe(
+        priority_df[
+            [
+                "Appliance",
+                "User Priority",
+                "User Priority Meaning",
+                "Company Priority",
+                "Company Priority Meaning"
+            ]
+        ],
+        use_container_width=True
+    )
 
     fig_priority = go.Figure()
 
@@ -2461,7 +2631,7 @@ with tab4:
         y=priority_df["User Priority"],
         name="Internal User Priority",
         marker_color="lime",
-        text=priority_df["User Priority"],
+        text=priority_df["User Priority Meaning"],
         textposition="auto"
     ))
 
@@ -2470,7 +2640,7 @@ with tab4:
         y=priority_df["Company Priority"],
         name="Internal Company Priority",
         marker_color="orange",
-        text=priority_df["Company Priority"],
+        text=priority_df["Company Priority Meaning"],
         textposition="auto"
     ))
 
@@ -2487,11 +2657,6 @@ with tab4:
 
     st.plotly_chart(fig_priority, use_container_width=True)
 
-    st.info(
-        "The user controls priorities using checkboxes. The app converts those checkboxes into internal SCADA priority numbers automatically."
-    )
-
-
 # =========================================================
 # FINAL SYSTEM SUMMARY
 # =========================================================
@@ -2499,7 +2664,13 @@ with tab4:
 st.divider()
 st.header("Final SCADA Decision Summary")
 
-if grid_stress and peak_event and achieved_reduction_percent < effective_mandatory_reduction_percent:
+if forced_fair_settlement_active:
+    st.error(
+        "Final Decision: Company forced fair settlement was activated. "
+        "The customer exceeded their own historical baseline during real line stress, "
+        "so the system forced reduction using company priority even if the customer wanted to pay more."
+    )
+elif grid_stress and peak_event and achieved_reduction_percent < effective_mandatory_reduction_percent:
     st.error(
         "Final Decision: The user did not satisfy the effective minimum physical grid protection requirement. "
         "The company may apply enforcement, restriction, or blocking logic in this simulation."
