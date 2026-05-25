@@ -2090,43 +2090,48 @@ policy_mode = st.session_state.selected_user_policy
 refuse_disconnect = st.session_state.refuse_disconnect
 climate_mode = st.session_state.climate_mode
 
+# One clean stress flag.
 stress_active = grid_stress and peak_event
 
+# Customer baseline relation.
 selected_surplus = max(requested_usage - selected_baseline, 0)
-
 customer_above_baseline = requested_usage > selected_baseline
+customer_within_or_below_baseline = requested_usage <= selected_baseline
 
-customer_within_baseline = requested_usage <= selected_baseline
-
-forced_fair_settlement_active = (
+# Last-resort mode means the company emergency settlement button is ON during stress.
+# This must disable the timer completely, even if the selected customer is within baseline.
+last_resort_mode_active = (
     company_force_fair_settlement
     and stress_active
+)
+
+# Forced settlement applies only to customers who are above baseline.
+# But timer blocking depends on last_resort_mode_active, not this variable.
+forced_fair_settlement_active = (
+    last_resort_mode_active
     and selected_surplus > 0
 )
 
-# Timer logic:
-# Timer should run ONLY when there is real stress AND force settlement is OFF AND:
-# - user refuses disconnection
-# - user ignored requests
-# - user is requesting above own baseline
+# TIMER RULE:
+# Timer is allowed ONLY when:
+# 1) stress is active
+# 2) last-resort mode is OFF
+# 3) selected customer is above baseline
 #
-# Timer should NOT run just because user is below/equal baseline.
+# Timer must NOT run when:
+# - last resort is ON
+# - customer is within/below baseline
+# - stress or peak is OFF
 timer_should_run = (
     stress_active
-    and not forced_fair_settlement_active
-    and (
-        refuse_disconnect
-        or user_failed_to_respond
-        or customer_above_baseline
-    )
+    and not last_resort_mode_active
+    and customer_above_baseline
 )
 
 timer_signature = (
     f"{selected_person}|"
     f"stress={stress_active}|"
-    f"force={forced_fair_settlement_active}|"
-    f"refuse={refuse_disconnect}|"
-    f"ignored={user_failed_to_respond}|"
+    f"last_resort={last_resort_mode_active}|"
     f"above_baseline={customer_above_baseline}|"
     f"requested={round(requested_usage, 2)}|"
     f"baseline={round(selected_baseline, 2)}|"
@@ -2136,7 +2141,7 @@ timer_signature = (
 deadline_penalty_active, timer_status = deadline_timer_engine(
     timer_should_run=timer_should_run,
     deadline_minutes=response_deadline_minutes,
-    force_settlement_active=forced_fair_settlement_active,
+    force_settlement_active=last_resort_mode_active,
     timer_signature=timer_signature
 )
 
