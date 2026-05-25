@@ -2426,8 +2426,14 @@ if forced_fair_settlement_active:
 elif company_force_fair_settlement and selected_surplus <= 0:
     st.success("Force settlement is ON, but this customer is within baseline. No forced action is needed.")
 
-if timer_should_run and not deadline_penalty_active:
-    st.warning("Timer is running because the user is delaying, refusing, or exceeding baseline during stress.")
+if last_resort_mode_active:
+    st.success("Timer disabled: last-resort fair settlement mode is active.")
+
+elif customer_within_or_below_baseline and stress_active:
+    st.success("Timer inactive: selected customer is within/below own baseline.")
+
+elif timer_should_run and not deadline_penalty_active:
+    st.warning("Timer is running because the selected customer is above baseline during stress.")
 
 if deadline_penalty_active:
     st.error("Deadline expired. Penalty/enforcement is now active.")
