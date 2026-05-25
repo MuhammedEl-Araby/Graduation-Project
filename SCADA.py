@@ -1,3 +1,4 @@
+
 import streamlit as st
 import streamlit.components.v1 as components
 import numpy as np
@@ -172,6 +173,10 @@ PREMIUM_PRESERVATION_RATE = 1.60
 DISCOUNT_RATE = 0.15
 BONUS_RATE = 0.10
 LOYALTY_DISCOUNT_RATE = 0.08
+GOOD_BEHAVIOR_STEP_DISCOUNT = 0.02
+GOOD_BEHAVIOR_MAX_DISCOUNT = 0.12
+PRIORITY_MIN = 1
+PRIORITY_MAX = 10
 
 LOW_BASELINE_THRESHOLD_KWH = 2.0
 LOW_BASELINE_MAX_REDUCTION_PERCENT = 10
@@ -201,8 +206,8 @@ def default_appliance_config():
             "Preserve Minimum Units": 10,
             "Disconnectable": False,
             "Critical": True,
-            "User Priority": 999,
-            "Company Priority": 999
+            "User Priority": 10,
+            "Company Priority": 10
         },
         {
             "Appliance": "Power Sockets",
@@ -320,6 +325,15 @@ if "ac_unit_states" not in st.session_state:
 if "deadline_started_at" not in st.session_state:
     st.session_state.deadline_started_at = None
 
+if "deadline_signature" not in st.session_state:
+    st.session_state.deadline_signature = None
+
+if "good_behavior_streak" not in st.session_state:
+    st.session_state.good_behavior_streak = 0
+
+if "last_behavior_event_id" not in st.session_state:
+    st.session_state.last_behavior_event_id = None
+
 if "company_force_fair_settlement" not in st.session_state:
     st.session_state.company_force_fair_settlement = False
 
@@ -366,6 +380,13 @@ if "ac_overlay_positions" not in st.session_state:
 def ensure_appliance_columns(df):
     df = df.copy()
 
+    # Migration from older code: keep Critical internally but add a clear protected flag.
+    if "Protected / Never Disconnect" not in df.columns:
+        if "Critical" in df.columns:
+            df["Protected / Never Disconnect"] = df["Critical"].astype(bool)
+        else:
+            df["Protected / Never Disconnect"] = False
+
     defaults = {
         "Appliance": "Unknown",
         "Quantity": 0,
@@ -374,6 +395,7 @@ def ensure_appliance_columns(df):
         "Load Category": "Normal Load",
         "Allow Company Emergency Control": True,
         "Preserve Minimum Units": 0,
+        "Protected / Never Disconnect": False,
         "Disconnectable": True,
         "Critical": False,
         "User Priority": 4,
@@ -388,6 +410,27 @@ def ensure_appliance_columns(df):
     df["Load Category"] = df["Load Category"].apply(
         lambda x: x if x in valid_categories else "Normal Load"
     )
+
+    for col in ["Quantity", "Preserve Minimum Units"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).clip(lower=0)
+
+    df["Power per Unit kW"] = pd.to_numeric(
+        df["Power per Unit kW"], errors="coerce"
+    ).fillna(0).clip(lower=0)
+
+    # Priority is now only 1 to 10. Protected flag is used instead or displayed.
+    for col in ["User Priority", "Company Priority"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(4).clip(PRIORITY_MIN, PRIORITY_MAX).astype(int)
+
+    for col in ["Connected", "Allow Company Emergency Control", "Protected / Never Disconnect", "Disconnectable", "Critical"]:
+        df[col] = df[col].astype(bool)
+
+    # Protected loads are protected by flags, not by ugly priority numbers.
+    protected_mask = df["Load Category"].eq("Critical / Never Disconnect") | df["Protected / Never Disconnect"]
+    df.loc[protected_mask, "Protected / Never Disconnect"] = True
+    df.loc[protected_mask, "Critical"] = True
+    df.loc[protected_mask, "Disconnectable"] = False
+    df.loc[protected_mask, "Preserve Minimum Units"] = df.loc[protected_mask, ["Preserve Minimum Units", "Quantity"]].max(axis=1)
 
     return df[list(defaults.keys())]
 
@@ -637,15 +680,16 @@ def household_input(title, default_lamps, default_acs, default_washing,
 # PRIORITY HELPERS
 # =========================================================
 
-def priority_meaning(priority_value):
+def priority_meaning_from_row(row, priority_col):
+    if bool(row.get("Protected / Never Disconnect", False)):
+        return "Protected - Never Disconnect"
+
     try:
-        p = int(priority_value)
+        p = int(row[priority_col])
     except Exception:
         return "Unknown"
 
-    if p >= 999:
-        return "Protected - Never Disconnect"
-    elif p == 1:
+    if p == 1:
         return "1 - Disconnect First"
     elif p == 2:
         return "2 - Disconnect Early"
@@ -662,56 +706,42 @@ def priority_meaning(priority_value):
 
 
 def add_priority_meaning_columns(df):
-    df = df.copy()
-    df["User Priority Meaning"] = df["User Priority"].apply(priority_meaning)
-    df["Company Priority Meaning"] = df["Company Priority"].apply(priority_meaning)
+    df = ensure_appliance_columns(df)
+    df["User Priority Meaning"] = df.apply(
+        lambda row: priority_meaning_from_row(row, "User Priority"), axis=1
+    )
+    df["Company Priority Meaning"] = df.apply(
+        lambda row: priority_meaning_from_row(row, "Company Priority"), axis=1
+    )
     return df
 
 
 def apply_load_category_priority_rules(appliance_df):
+    """
+    Important fix:
+    - This function no longer overwrites User Priority or Company Priority.
+    - User and Company priorities are editable and actually used by shedding.
+    - Critical loads are protected by flags, not by 10.
+    """
     df = ensure_appliance_columns(appliance_df)
 
     for idx, row in df.iterrows():
         category = row["Load Category"]
-        allow_company = bool(row["Allow Company Emergency Control"])
 
         if category == "Critical / Never Disconnect":
             df.loc[idx, "Critical"] = True
+            df.loc[idx, "Protected / Never Disconnect"] = True
             df.loc[idx, "Disconnectable"] = False
-            df.loc[idx, "User Priority"] = 999
-            df.loc[idx, "Company Priority"] = 999
-
-        elif category == "Shed First":
-            df.loc[idx, "Critical"] = False
-            df.loc[idx, "Disconnectable"] = True
-            df.loc[idx, "User Priority"] = 1
-            df.loc[idx, "Company Priority"] = 1 if allow_company else 7
-
-        elif category == "Luxury Load":
-            df.loc[idx, "Critical"] = False
-            df.loc[idx, "Disconnectable"] = True
-            df.loc[idx, "User Priority"] = 2
-            df.loc[idx, "Company Priority"] = 2 if allow_company else 8
-
-        elif category == "Normal Load":
-            df.loc[idx, "Critical"] = False
-            df.loc[idx, "Disconnectable"] = True
-            df.loc[idx, "User Priority"] = 4
-            df.loc[idx, "Company Priority"] = 4 if allow_company else 10
-
-        elif category == "Comfort Load":
-            df.loc[idx, "Critical"] = False
-            df.loc[idx, "Disconnectable"] = True
-            df.loc[idx, "User Priority"] = 5
-            df.loc[idx, "Company Priority"] = 3 if allow_company else 9
-
+            df.loc[idx, "Preserve Minimum Units"] = max(
+                float(row["Preserve Minimum Units"]),
+                float(row["Quantity"])
+            )
         else:
             df.loc[idx, "Critical"] = False
+            df.loc[idx, "Protected / Never Disconnect"] = False
             df.loc[idx, "Disconnectable"] = True
-            df.loc[idx, "User Priority"] = 4
-            df.loc[idx, "Company Priority"] = 4 if allow_company else 10
 
-    return df
+    return ensure_appliance_columns(df)
 
 
 # =========================================================
@@ -796,48 +826,48 @@ def smart_meter_shed_load(
     mandatory_minimum_percent,
     user_failed_to_respond,
     enforcement_enabled,
-    minimum_service_enabled
+    minimum_service_enabled,
+    force_mode=False
 ):
     df = calculate_current_connected_load(appliance_df)
 
     original_load = df["Connected Load kW"].sum()
 
+    df["Disconnected Units"] = 0.0
+    df["Remaining Units"] = df["Quantity"].astype(float)
+    df["Shed kW"] = 0.0
+
     if original_load <= 0:
-        df["Disconnected Units"] = 0
-        df["Remaining Units"] = 0
-        df["Shed kW"] = 0
         return df, 0, 0, 0, "No active load"
 
     requested_reduction_kw = original_load * requested_reduction_percent / 100
     mandatory_reduction_kw = original_load * mandatory_minimum_percent / 100
 
-    if refuse_disconnect:
+    if force_mode:
+        target_reduction_kw = max(requested_reduction_kw, mandatory_reduction_kw)
+        active_policy = "Company Priority"
+        enforcement_status = (
+            "Last-resort fair settlement is active. Company priority forcibly shed the highest allowed loads. "
+            "Protected loads were not touched."
+        )
+    elif refuse_disconnect:
         if enforcement_enabled and user_failed_to_respond:
             target_reduction_kw = mandatory_reduction_kw
-            active_policy = "Company Emergency Enforcement"
-            enforcement_status = "User refused or ignored request. Mandatory reduction was enforced."
+            active_policy = "Company Priority"
+            enforcement_status = "User refused or ignored request. Mandatory emergency reduction was enforced."
         else:
             target_reduction_kw = 0
-            active_policy = "User Refused Disconnection"
-            enforcement_status = "No load was disconnected. Premium pricing applied."
+            active_policy = policy_mode
+            enforcement_status = "No load was disconnected. Premium pricing/timer may apply."
     else:
         target_reduction_kw = requested_reduction_kw
         active_policy = policy_mode
         enforcement_status = "Smart meter priority was applied."
 
     if target_reduction_kw <= 0:
-        df["Disconnected Units"] = 0
-        df["Remaining Units"] = df["Quantity"]
-        df["Shed kW"] = 0.0
         return df, original_load, original_load, 0, enforcement_status
 
-    df["Disconnected Units"] = 0
-    df["Remaining Units"] = df["Quantity"]
-    df["Shed kW"] = 0.0
-
-    if active_policy == "Company Emergency Enforcement":
-        priority_col = "Company Priority"
-    elif policy_mode == "Company Priority":
+    if active_policy == "Company Priority":
         priority_col = "Company Priority"
     else:
         priority_col = "User Priority"
@@ -847,10 +877,15 @@ def smart_meter_shed_load(
     candidates = df[
         (df["Connected"] == True) &
         (df["Disconnectable"] == True) &
-        (df["Critical"] == False)
+        (df["Critical"] == False) &
+        (df["Protected / Never Disconnect"] == False)
     ].copy()
 
-    candidates = candidates.sort_values(by=priority_col, ascending=True)
+    # Lower priority number disconnects first. If tied, shed highest power loads first.
+    candidates = candidates.sort_values(
+        by=[priority_col, "Power per Unit kW", "Quantity"],
+        ascending=[True, False, False]
+    )
 
     for idx, row in candidates.iterrows():
         if shed_so_far >= target_reduction_kw:
@@ -864,7 +899,6 @@ def smart_meter_shed_load(
         if minimum_service_enabled:
             if climate_mode == "Hot Summer - Cooling Priority" and appliance == "ACs":
                 preserve_minimum = max(preserve_minimum, 1)
-
             if climate_mode == "Cold Winter - Heating Priority" and appliance == "Water Heater":
                 preserve_minimum = max(preserve_minimum, 1)
 
@@ -896,6 +930,7 @@ def smart_meter_shed_load(
 
 def billing_engine(
     baseline,
+    requested_usage,
     final_usage,
     mean_usage,
     grid_stress,
@@ -905,10 +940,16 @@ def billing_engine(
     mandatory_reduction_percent,
     fair_conditions,
     deadline_penalty_active,
-    forced_fair_settlement_active
+    forced_fair_settlement_active,
+    good_behavior_discount_rate
 ):
     premium_usage = max(final_usage - baseline, 0)
     normal_usage = min(final_usage, baseline)
+
+    no_action_bill = (
+        min(requested_usage, baseline) * BASE_RATE +
+        max(requested_usage - baseline, 0) * (PREMIUM_PRESERVATION_RATE if grid_stress else BASE_RATE)
+    )
 
     bill = normal_usage * BASE_RATE
 
@@ -918,6 +959,7 @@ def billing_engine(
     premium_charge = 0
     discount = 0
     loyalty_discount = 0
+    good_behavior_discount = 0
     penalty_waived = 0
     status = []
 
@@ -999,6 +1041,11 @@ def billing_engine(
         discount += loyalty_discount
         status.append("Loyalty discount applied because usage stayed at or below historical baseline during peak stress.")
 
+    if good_behavior_discount_rate > 0 and grid_stress and final_usage <= baseline:
+        good_behavior_discount = bill * good_behavior_discount_rate
+        bill -= good_behavior_discount
+        status.append(f"Repeated good-behavior discount applied: {good_behavior_discount_rate * 100:.0f}%.")
+
     if refused_disconnect and grid_stress and not forced_fair_settlement_active:
         if fair_conditions["customer_autonomy"]:
             status.append("User used manual override. Timer, premium pricing, or emergency enforcement may apply.")
@@ -1008,6 +1055,9 @@ def billing_engine(
 
     if not status:
         status.append("Normal billing condition.")
+
+    final_bill = max(bill, 0)
+    amount_saved = max(no_action_bill - final_bill, 0)
 
     return {
         "Normal Usage kWh": normal_usage,
@@ -1019,7 +1069,10 @@ def billing_engine(
         "Bonus": bonus,
         "Discount": discount,
         "Loyalty Discount": loyalty_discount,
-        "Final Bill": bill,
+        "Good Behavior Discount": good_behavior_discount,
+        "No Action Bill": no_action_bill,
+        "Amount Saved": amount_saved,
+        "Final Bill": final_bill,
         "Status": " | ".join(status)
     }
 
@@ -1028,21 +1081,33 @@ def billing_engine(
 # TIMER ENGINE
 # =========================================================
 
-def deadline_timer_engine(timer_should_run, deadline_minutes, force_settlement_active):
+def reset_deadline_timer():
+    st.session_state.deadline_started_at = None
+    st.session_state.deadline_signature = None
+
+
+def deadline_timer_engine(timer_should_run, deadline_minutes, force_settlement_active, timer_signature=None):
     now = time.time()
 
     if force_settlement_active:
-        st.session_state.deadline_started_at = None
+        reset_deadline_timer()
         return False, "Timer disabled because forced fair settlement is active."
 
     if not timer_should_run:
-        st.session_state.deadline_started_at = None
+        reset_deadline_timer()
         return False, "Timer inactive."
+
+    if timer_signature is None:
+        timer_signature = "default_timer_signature"
+
+    if st.session_state.deadline_signature != timer_signature:
+        st.session_state.deadline_signature = timer_signature
+        st.session_state.deadline_started_at = now
 
     if st.session_state.deadline_started_at is None:
         st.session_state.deadline_started_at = now
 
-    deadline_seconds = max(deadline_minutes * 60, 1)
+    deadline_seconds = max(int(deadline_minutes * 60), 1)
     elapsed = now - st.session_state.deadline_started_at
     remaining = max(deadline_seconds - elapsed, 0)
 
@@ -1179,7 +1244,7 @@ def render_ac_plan_overlay(image_path, ac_states, positions, show_added_labels=F
     image = Image.open(image_path).convert("RGBA")
     draw = ImageDraw.Draw(image)
 
-    symbol_font = get_font(130)
+    symbol_font = get_font(170)
     label_font = get_font(24)
 
     for ac_name, is_on in ac_states.items():
@@ -1203,7 +1268,7 @@ def render_ac_plan_overlay(image_path, ac_states, positions, show_added_labels=F
             font=symbol_font,
             fill=color,
             outline_fill="black",
-            outline_width=13
+            outline_width=15
         )
 
         if show_added_labels:
@@ -1228,6 +1293,7 @@ page = st.radio(
         "SCADA Control Center",
         "Smart Meter Override Page",
         "Real Life Simulation",
+        "Crisis Live Simulation",
         "How To Use",
         "AI & Model Details"
     ],
@@ -1257,6 +1323,12 @@ with st.sidebar:
     st.write(f"Grid support discount: **{int(DISCOUNT_RATE * 100)}%**")
     st.write(f"Loyalty baseline discount: **{int(LOYALTY_DISCOUNT_RATE * 100)}%**")
     st.write(f"Growth bonus: **{int(BONUS_RATE * 100)}%**")
+    st.write(f"Good behavior discount cap: **{int(GOOD_BEHAVIOR_MAX_DISCOUNT * 100)}%**")
+    st.metric("Good Behavior Streak", st.session_state.good_behavior_streak)
+    if st.button("Reset good-behavior tracker"):
+        st.session_state.good_behavior_streak = 0
+        st.session_state.last_behavior_event_id = None
+        st.rerun()
 
 
 # =========================================================
@@ -1278,7 +1350,7 @@ The priority number is a load-shedding order.
 - **2** means disconnect early.
 - **4** means normal shedding.
 - **5** means preserve longer.
-- **999** means protected and never disconnected.
+- **Protected / Never Disconnect** means it cannot be disconnected. Protected flag is used instead.
 
 </div>
 
@@ -1541,6 +1613,96 @@ Pattern: AC6 — AC5 — AC2 / AC3 — AC1 / AC4
     st.stop()
 
 
+
+# =========================================================
+# CRISIS LIVE SIMULATION PAGE
+# =========================================================
+
+if page == "Crisis Live Simulation":
+
+    st.title("Crisis Live Simulation")
+
+    st.markdown("""
+<div class="scada-card">
+<div class="big-status">Live Crisis Simulator</div>
+This page shows direct priority shedding without the full billing section.
+It respects protected loads, editable User Priority, editable Company Priority, and minimum service.
+</div>
+    """, unsafe_allow_html=True)
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    with c1:
+        crisis_reduction = st.slider(
+            "Crisis Reduction Target (%)",
+            min_value=0,
+            max_value=90,
+            value=35,
+            step=1
+        )
+
+    with c2:
+        crisis_policy = st.selectbox(
+            "Crisis Priority Mode",
+            ["Manual User Priority", "Company Priority"],
+            index=1
+        )
+
+    with c3:
+        force_crisis = st.checkbox("Force crisis shedding now", value=True)
+
+    with c4:
+        min_service = st.checkbox("Minimum service preservation", value=True)
+
+    crisis_df, crisis_original_kw, crisis_final_kw, crisis_achieved, crisis_msg = smart_meter_shed_load(
+        appliance_df=st.session_state.appliance_config,
+        requested_reduction_percent=crisis_reduction,
+        policy_mode=crisis_policy,
+        refuse_disconnect=False,
+        climate_mode=st.session_state.climate_mode,
+        mandatory_minimum_percent=crisis_reduction,
+        user_failed_to_respond=True,
+        enforcement_enabled=True,
+        minimum_service_enabled=min_service,
+        force_mode=force_crisis
+    )
+
+    cm1, cm2, cm3 = st.columns(3)
+    cm1.metric("Original kW", f"{crisis_original_kw:.2f}")
+    cm2.metric("Final kW", f"{crisis_final_kw:.2f}")
+    cm3.metric("Achieved Reduction", f"{crisis_achieved:.2f}%")
+
+    if crisis_achieved >= crisis_reduction:
+        st.success("Crisis target satisfied. Grid is stable in this simulation.")
+    else:
+        st.warning("Crisis target is not fully satisfied. More controllable load is needed.")
+
+    st.info(crisis_msg)
+    st.dataframe(crisis_df, use_container_width=True)
+
+    fig_crisis_units = go.Figure()
+    fig_crisis_units.add_trace(go.Bar(
+        x=crisis_df["Appliance"],
+        y=crisis_df["Quantity"],
+        name="Before Units",
+        marker_color="deepskyblue"
+    ))
+    fig_crisis_units.add_trace(go.Bar(
+        x=crisis_df["Appliance"],
+        y=crisis_df["Remaining Units"],
+        name="After Units",
+        marker_color="lime"
+    ))
+    fig_crisis_units.update_layout(
+        title="Live Crisis Unit Reduction",
+        barmode="group",
+        template="plotly_dark",
+        height=600
+    )
+    st.plotly_chart(fig_crisis_units, use_container_width=True)
+
+    st.stop()
+
 # =========================================================
 # SMART METER OVERRIDE PAGE
 # =========================================================
@@ -1551,7 +1713,7 @@ if page == "Smart Meter Override Page":
 
     st.info(
         "Priority direction: lower number means disconnect earlier. "
-        "Higher number means preserve longer. 999 means protected and never disconnected."
+        "Higher number means preserve longer. Protected loads cannot be disconnected. Protected flag is used instead."
     )
 
     col_a, col_b, col_c = st.columns(3)
@@ -1606,10 +1768,11 @@ if page == "Smart Meter Override Page":
             ),
             "Allow Company Emergency Control": st.column_config.CheckboxColumn("Allow Company Emergency Control"),
             "Preserve Minimum Units": st.column_config.NumberColumn("Preserve Minimum Units", min_value=0, step=1),
+            "Protected / Never Disconnect": st.column_config.CheckboxColumn("Protected / Never Disconnect", disabled=True),
             "Disconnectable": st.column_config.CheckboxColumn("Internal Disconnectable", disabled=True),
             "Critical": st.column_config.CheckboxColumn("Internal Critical", disabled=True),
-            "User Priority": st.column_config.NumberColumn("Internal User Priority", disabled=True),
-            "Company Priority": st.column_config.NumberColumn("Internal Company Priority", disabled=True)
+            "User Priority": st.column_config.NumberColumn("User Priority 1-10", min_value=1, max_value=10, step=1),
+            "Company Priority": st.column_config.NumberColumn("Company Priority 1-10", min_value=1, max_value=10, step=1)
         }
     )
 
@@ -1625,6 +1788,7 @@ if page == "Smart Meter Override Page":
                 "Appliance",
                 "Load Category",
                 "Allow Company Emergency Control",
+                "Protected / Never Disconnect",
                 "User Priority Meaning",
                 "Company Priority Meaning"
             ]
@@ -1671,10 +1835,16 @@ if page == "Smart Meter Override Page":
 
 st.title("SCADA Dynamic Pricing & Smart Meter Control Center")
 
-st.warning(
-    "⚠ PEAK EVENT NOTIFICATION: High electrical demand is active. "
-    "The smart meter may request load reduction. Premium Load Preservation Pricing may apply."
-)
+if st.session_state.get("company_force_fair_settlement", False):
+    st.success(
+        "GRID STABLE MODE: Last-resort fair settlement is ON. "
+        "Peak-event warning is hidden because the system is forcing the line back to a fair stable state."
+    )
+else:
+    st.warning(
+        "⚠ PEAK EVENT NOTIFICATION: High electrical demand is active. "
+        "The smart meter may request load reduction. Premium Load Preservation Pricing may apply."
+    )
 
 st.markdown("""
 <div class="scada-card">
@@ -1940,10 +2110,13 @@ timer_should_run = (
     )
 )
 
+timer_signature = f"{selected_person}|{grid_stress}|{peak_event}|{refuse_disconnect}|{requested_usage:.2f}|{selected_baseline:.2f}|{response_deadline_minutes}"
+
 deadline_penalty_active, timer_status = deadline_timer_engine(
     timer_should_run=timer_should_run,
     deadline_minutes=response_deadline_minutes,
-    force_settlement_active=forced_fair_settlement_active
+    force_settlement_active=forced_fair_settlement_active,
+    timer_signature=timer_signature
 )
 
 if deadline_penalty_active:
@@ -2037,7 +2210,8 @@ shed_df, original_load_kw, final_load_kw, achieved_reduction_percent, enforcemen
             and fair_conditions["emergency_enforcement"]
         )
     ),
-    minimum_service_enabled=fair_conditions["minimum_service"]
+    minimum_service_enabled=fair_conditions["minimum_service"],
+    force_mode=forced_fair_settlement_active
 )
 
 if original_load_kw > 0:
@@ -2052,8 +2226,14 @@ if forced_fair_settlement_active:
 else:
     final_usage = final_usage_raw
 
+good_behavior_discount_rate = min(
+    st.session_state.good_behavior_streak * GOOD_BEHAVIOR_STEP_DISCOUNT,
+    GOOD_BEHAVIOR_MAX_DISCOUNT
+)
+
 billing = billing_engine(
     baseline=selected_baseline,
+    requested_usage=requested_usage,
     final_usage=final_usage,
     mean_usage=mean_usage,
     grid_stress=grid_stress and peak_event,
@@ -2063,9 +2243,42 @@ billing = billing_engine(
     mandatory_reduction_percent=effective_mandatory_reduction_percent,
     fair_conditions=fair_conditions,
     deadline_penalty_active=deadline_penalty_active,
-    forced_fair_settlement_active=forced_fair_settlement_active
+    forced_fair_settlement_active=forced_fair_settlement_active,
+    good_behavior_discount_rate=good_behavior_discount_rate
 )
 
+
+
+# =========================================================
+# REPEATED GOOD-BEHAVIOR TRACKING
+# =========================================================
+behavior_event_id = (
+    f"{selected_person}|{round(requested_usage, 2)}|{round(selected_baseline, 2)}|"
+    f"{grid_stress}|{peak_event}|{round(effective_mandatory_reduction_percent, 2)}|"
+    f"{round(achieved_reduction_percent, 2)}"
+)
+
+good_event = (
+    grid_stress
+    and peak_event
+    and achieved_reduction_percent >= effective_mandatory_reduction_percent
+    and final_usage <= selected_baseline
+)
+
+bad_event = (
+    grid_stress
+    and peak_event
+    and achieved_reduction_percent < effective_mandatory_reduction_percent
+    and not forced_fair_settlement_active
+)
+
+if behavior_event_id != st.session_state.last_behavior_event_id:
+    if good_event:
+        st.session_state.good_behavior_streak += 1
+        st.session_state.last_behavior_event_id = behavior_event_id
+    elif bad_event:
+        st.session_state.good_behavior_streak = 0
+        st.session_state.last_behavior_event_id = behavior_event_id
 
 # =========================================================
 # MAIN SCADA METRICS
@@ -2074,13 +2287,14 @@ billing = billing_engine(
 st.divider()
 st.header("SCADA Live Status")
 
-s1, s2, s3, s4, s5 = st.columns(5)
+s1, s2, s3, s4, s5, s6 = st.columns(6)
 
 s1.metric("Original Connected Load", f"{original_load_kw:.2f} kW")
 s2.metric("Final Connected Load", f"{final_load_kw:.2f} kW")
 s3.metric("Achieved Reduction", f"{achieved_reduction_percent:.2f}%")
 s4.metric("Final Usage", f"{final_usage:.2f} kWh")
 s5.metric("Final Bill", f"{billing['Final Bill']:.2f} EGP")
+s6.metric("Amount Saved", f"{billing['Amount Saved']:.2f} EGP")
 
 e1, e2 = st.columns(2)
 e1.metric("Effective Voluntary Reduction", f"{effective_voluntary_reduction_percent:.2f}%")
@@ -2090,9 +2304,12 @@ e3, e4 = st.columns(2)
 e3.metric("Forced Fair Settlement", "Active" if forced_fair_settlement_active else "Inactive")
 e4.metric("Timer Penalty", "Active" if deadline_penalty_active else "Inactive")
 
+st.metric("Repeated Good-Behavior Discount Rate", f"{good_behavior_discount_rate * 100:.0f}%")
+
 if forced_fair_settlement_active:
     st.error(forced_fair_settlement_reason)
     st.error("ACCESS DENIED: The customer cannot exceed the fair baseline limit during physical line stress.")
+    st.success("GRID STABLE: Last-resort fair settlement reduced the above-baseline load. The peak event message is cleared for the stabilized line.")
 elif company_force_fair_settlement and selected_surplus <= 0:
     st.success("Force settlement is ON, but this customer is within baseline. No forced action is needed.")
 
@@ -2113,6 +2330,43 @@ st.divider()
 st.header("Smart Meter Load Shedding Result")
 
 st.dataframe(shed_df, use_container_width=True)
+
+st.subheader("Before / After Appliance Quantities")
+qty_view = shed_df[[
+    "Appliance",
+    "Quantity",
+    "Disconnected Units",
+    "Remaining Units",
+    "Power per Unit kW",
+    "Shed kW",
+    "Protected / Never Disconnect",
+    "User Priority",
+    "Company Priority"
+]].copy()
+st.dataframe(qty_view, use_container_width=True)
+
+fig_units = go.Figure()
+fig_units.add_trace(go.Bar(
+    x=qty_view["Appliance"],
+    y=qty_view["Quantity"],
+    name="Before Units",
+    marker_color="deepskyblue",
+    text=qty_view["Quantity"]
+))
+fig_units.add_trace(go.Bar(
+    x=qty_view["Appliance"],
+    y=qty_view["Remaining Units"],
+    name="After Units",
+    marker_color="lime",
+    text=qty_view["Remaining Units"]
+))
+fig_units.update_layout(
+    title="Visible Unit Decrease After Shedding / Fair Settlement",
+    barmode="group",
+    template="plotly_dark",
+    height=620
+)
+st.plotly_chart(fig_units, use_container_width=True)
 
 
 # =========================================================
@@ -2140,6 +2394,64 @@ if company_force_fair_settlement and grid_stress and peak_event:
             "Both users are above baseline. Forced settlement applies fairly to both users according to their own surplus."
         )
 
+
+
+if company_force_fair_settlement and grid_stress and peak_event:
+    both_results = []
+
+    for client_name, baseline_value, requested_value, household_df in [
+        ("Person A", baseline_a, requested_usage_a, person_a),
+        ("Person B", baseline_b, requested_usage_b, person_b)
+    ]:
+        surplus_value = max(requested_value - baseline_value, 0)
+        forced_percent_value = (surplus_value / max(requested_value, 0.001)) * 100 if surplus_value > 0 else 0
+
+        client_config = apply_household_counts_to_appliance_config(
+            st.session_state.appliance_config,
+            household_df
+        )
+
+        client_shed_df, client_original_kw, client_final_kw, client_achieved, client_msg = smart_meter_shed_load(
+            appliance_df=client_config,
+            requested_reduction_percent=forced_percent_value,
+            policy_mode="Company Priority",
+            refuse_disconnect=False,
+            climate_mode=climate_mode,
+            mandatory_minimum_percent=forced_percent_value,
+            user_failed_to_respond=True,
+            enforcement_enabled=True,
+            minimum_service_enabled=fair_conditions["minimum_service"],
+            force_mode=surplus_value > 0
+        )
+
+        for _, load_row in client_shed_df.iterrows():
+            if load_row["Disconnected Units"] > 0 or load_row["Appliance"] in ["Lights", "Washing Machine", "Heavy Machines", "ACs"]:
+                both_results.append({
+                    "Client": client_name,
+                    "Appliance": load_row["Appliance"],
+                    "Before Units": load_row["Quantity"],
+                    "Disconnected Units": load_row["Disconnected Units"],
+                    "After Units": load_row["Remaining Units"],
+                    "Shed kW": load_row["Shed kW"],
+                    "Status": "Forced" if surplus_value > 0 else "Protected within baseline"
+                })
+
+    both_settlement_df = pd.DataFrame(both_results)
+    st.subheader("Last-Resort Fair Settlement Live Result For Both Users")
+    st.dataframe(both_settlement_df, use_container_width=True)
+
+    if not both_settlement_df.empty:
+        fig_both = px.bar(
+            both_settlement_df,
+            x="Appliance",
+            y="Disconnected Units",
+            color="Client",
+            barmode="group",
+            title="Disconnected Units by Client Under Fair Settlement",
+            text_auto=".0f"
+        )
+        fig_both.update_layout(template="plotly_dark", height=580)
+        st.plotly_chart(fig_both, use_container_width=True)
 
 # =========================================================
 # CONDITION EVALUATION
@@ -2185,7 +2497,7 @@ condition_rows.append({
 condition_rows.append({
     "Condition": "Priority direction",
     "Active": True,
-    "Rule": "Lower number disconnects earlier; 999 means never disconnect",
+    "Rule": "Lower number disconnects earlier; 10 means never disconnect",
     "Result": "Heavy/luxury loads shed before protected lights",
     "Status": "Active"
 })
@@ -2231,6 +2543,9 @@ billing_df = pd.DataFrame([{
     "Bonus EGP": billing["Bonus"],
     "Discount EGP": billing["Discount"],
     "Loyalty Discount EGP": billing["Loyalty Discount"],
+    "Good Behavior Discount EGP": billing["Good Behavior Discount"],
+    "No Action Bill EGP": billing["No Action Bill"],
+    "Amount Saved EGP": billing["Amount Saved"],
     "Final Bill EGP": billing["Final Bill"],
     "Condition Status": billing["Status"]
 }])
@@ -2322,6 +2637,8 @@ with tab2:
             "Bonus",
             "Discount",
             "Loyalty Discount",
+            "Good Behavior Discount",
+            "Amount Saved",
             "Final Bill"
         ],
         "EGP": [
@@ -2332,6 +2649,8 @@ with tab2:
             billing["Bonus"],
             billing["Discount"],
             billing["Loyalty Discount"],
+            billing["Good Behavior Discount"],
+            billing["Amount Saved"],
             billing["Final Bill"]
         ]
     })
@@ -2424,7 +2743,7 @@ with tab4:
 
     st.info(
         "Lower priority number means disconnect earlier. "
-        "Higher priority number means preserve longer. 999 means protected and never disconnected."
+        "Higher priority number means preserve longer. Protected means never disconnected. Protected flag is used instead."
     )
 
     st.dataframe(
@@ -2432,6 +2751,7 @@ with tab4:
             [
                 "Appliance",
                 "Load Category",
+                "Protected / Never Disconnect",
                 "User Priority",
                 "User Priority Meaning",
                 "Company Priority",
