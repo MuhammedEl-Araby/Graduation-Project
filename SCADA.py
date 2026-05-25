@@ -334,6 +334,12 @@ if "good_behavior_streak" not in st.session_state:
 if "last_behavior_event_id" not in st.session_state:
     st.session_state.last_behavior_event_id = None
 
+if "previous_requested_usage_by_person" not in st.session_state:
+    st.session_state.previous_requested_usage_by_person = {}
+
+if "last_good_behavior_counted_event" not in st.session_state:
+    st.session_state.last_good_behavior_counted_event = None
+
 if "company_force_fair_settlement" not in st.session_state:
     st.session_state.company_force_fair_settlement = False
 
@@ -2285,16 +2291,24 @@ stress_active = grid_stress and peak_event
 customer_above_baseline = requested_usage > selected_baseline
 customer_within_baseline = requested_usage <= selected_baseline
 
-customer_actually_reduced_load = final_usage < requested_usage
+previous_requested_usage = st.session_state.previous_requested_usage_by_person.get(
+    selected_person,
+    requested_usage
+)
+
+customer_manually_decreased_request = requested_usage < previous_requested_usage
+customer_manually_increased_request = requested_usage > previous_requested_usage
+customer_request_unchanged = requested_usage == previous_requested_usage
 
 customer_supported_grid_enough = (
     achieved_reduction_percent >= effective_mandatory_reduction_percent
 )
 
+# Good behavior counts ONLY when the user voluntarily decreases requested usage.
 voluntary_good_behavior = (
     stress_active
+    and customer_manually_decreased_request
     and customer_within_baseline
-    and customer_actually_reduced_load
     and customer_supported_grid_enough
     and not refuse_disconnect
     and not user_failed_to_respond
@@ -2303,10 +2317,12 @@ voluntary_good_behavior = (
     and effective_mandatory_reduction_percent > 0
 )
 
+# Bad behavior resets streak.
 bad_behavior_event = (
     stress_active
     and (
         customer_above_baseline
+        or customer_manually_increased_request
         or refuse_disconnect
         or user_failed_to_respond
         or deadline_penalty_active
@@ -2323,7 +2339,7 @@ neutral_behavior_event = (
     or (
         stress_active
         and customer_within_baseline
-        and not customer_actually_reduced_load
+        and customer_request_unchanged
         and not refuse_disconnect
         and not user_failed_to_respond
         and not deadline_penalty_active
@@ -2331,13 +2347,11 @@ neutral_behavior_event = (
     )
 )
 
-# Important:
-# Do NOT use achieved_reduction_percent in this ID.
-# Otherwise every small shedding recalculation can count as a new event.
 behavior_event_id = (
     f"{selected_person}|"
+    f"previous_requested={round(previous_requested_usage, 2)}|"
+    f"current_requested={round(requested_usage, 2)}|"
     f"baseline={round(selected_baseline, 2)}|"
-    f"requested={round(requested_usage, 2)}|"
     f"stress={stress_active}|"
     f"mandatory={round(effective_mandatory_reduction_percent, 2)}|"
     f"refuse={refuse_disconnect}|"
@@ -2348,50 +2362,50 @@ behavior_event_id = (
 
 good_behavior_status_message = "No good-behavior event evaluated."
 
-if behavior_event_id != st.session_state.last_behavior_event_id:
+if behavior_event_id != st.session_state.last_good_behavior_counted_event:
 
     if voluntary_good_behavior:
         st.session_state.good_behavior_streak += 1
-        st.session_state.last_behavior_event_id = behavior_event_id
+        st.session_state.last_good_behavior_counted_event = behavior_event_id
         good_behavior_status_message = (
-            "Good behavior counted: customer stayed within baseline, did not refuse, "
-            "and voluntarily supported the grid enough during stress."
+            "Good behavior counted: customer voluntarily decreased requested usage, "
+            "stayed within baseline, and supported the grid."
         )
 
     elif bad_behavior_event:
         st.session_state.good_behavior_streak = 0
-        st.session_state.last_behavior_event_id = behavior_event_id
+        st.session_state.last_good_behavior_counted_event = behavior_event_id
         good_behavior_status_message = (
-            "Good behavior streak reset: customer exceeded baseline, refused, ignored, "
-            "needed forced settlement, or failed mandatory support."
+            "Good behavior streak reset: customer increased demand, exceeded baseline, "
+            "refused, delayed, needed forced settlement, or failed mandatory support."
         )
 
     elif neutral_behavior_event:
-        st.session_state.last_behavior_event_id = behavior_event_id
+        st.session_state.last_good_behavior_counted_event = behavior_event_id
         good_behavior_status_message = (
-            "No streak change: customer was neutral. They did not behave badly, "
-            "but no real voluntary grid support was detected."
+            "No streak change: customer stayed neutral. No voluntary decrease was detected."
         )
 
     else:
-        st.session_state.last_behavior_event_id = behavior_event_id
+        st.session_state.last_good_behavior_counted_event = behavior_event_id
         good_behavior_status_message = (
             "No streak change: event did not qualify as good or bad behavior."
         )
 
 else:
     good_behavior_status_message = (
-        "Same event already evaluated. Streak was not counted again."
+        "Same behavior event already evaluated. Streak was not counted again."
     )
 
-# Recalculate the discount rate AFTER updating the streak,
-# so the displayed discount matches the new streak immediately.
+# Update previous requested usage AFTER evaluating behavior.
+# This is very important.
+st.session_state.previous_requested_usage_by_person[selected_person] = requested_usage
+
+# Recalculate displayed good-behavior discount after streak update.
 good_behavior_discount_rate = min(
     st.session_state.good_behavior_streak * GOOD_BEHAVIOR_STEP_DISCOUNT,
     GOOD_BEHAVIOR_MAX_DISCOUNT
 )
-
-
 
 # =========================================================
 # MAIN SCADA METRICS
@@ -2418,6 +2432,7 @@ e3.metric("Forced Fair Settlement", "Active" if forced_fair_settlement_active el
 e4.metric("Timer Penalty", "Active" if deadline_penalty_active else "Inactive")
 
 st.metric("Repeated Good-Behavior Discount Rate", f"{good_behavior_discount_rate * 100:.0f}%")
+st.info(good_behavior_status_message)
 
 if forced_fair_settlement_active:
     st.error(forced_fair_settlement_reason)
