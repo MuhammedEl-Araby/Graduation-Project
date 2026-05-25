@@ -2090,27 +2090,48 @@ policy_mode = st.session_state.selected_user_policy
 refuse_disconnect = st.session_state.refuse_disconnect
 climate_mode = st.session_state.climate_mode
 
+stress_active = grid_stress and peak_event
+
 selected_surplus = max(requested_usage - selected_baseline, 0)
+
+customer_above_baseline = requested_usage > selected_baseline
+
+customer_within_baseline = requested_usage <= selected_baseline
 
 forced_fair_settlement_active = (
     company_force_fair_settlement
-    and grid_stress
-    and peak_event
+    and stress_active
     and selected_surplus > 0
 )
 
+# Timer logic:
+# Timer should run ONLY when there is real stress AND force settlement is OFF AND:
+# - user refuses disconnection
+# - user ignored requests
+# - user is requesting above own baseline
+#
+# Timer should NOT run just because user is below/equal baseline.
 timer_should_run = (
-    grid_stress
-    and peak_event
+    stress_active
     and not forced_fair_settlement_active
     and (
         refuse_disconnect
-        or requested_usage > selected_baseline
         or user_failed_to_respond
+        or customer_above_baseline
     )
 )
 
-timer_signature = f"{selected_person}|{grid_stress}|{peak_event}|{refuse_disconnect}|{requested_usage:.2f}|{selected_baseline:.2f}|{response_deadline_minutes}"
+timer_signature = (
+    f"{selected_person}|"
+    f"stress={stress_active}|"
+    f"force={forced_fair_settlement_active}|"
+    f"refuse={refuse_disconnect}|"
+    f"ignored={user_failed_to_respond}|"
+    f"above_baseline={customer_above_baseline}|"
+    f"requested={round(requested_usage, 2)}|"
+    f"baseline={round(selected_baseline, 2)}|"
+    f"deadline={response_deadline_minutes}"
+)
 
 deadline_penalty_active, timer_status = deadline_timer_engine(
     timer_should_run=timer_should_run,
@@ -2121,6 +2142,7 @@ deadline_penalty_active, timer_status = deadline_timer_engine(
 
 if deadline_penalty_active:
     user_failed_to_respond = True
+
 
 
 # =========================================================
