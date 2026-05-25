@@ -2252,33 +2252,91 @@ billing = billing_engine(
 # =========================================================
 # REPEATED GOOD-BEHAVIOR TRACKING
 # =========================================================
-behavior_event_id = (
-    f"{selected_person}|{round(requested_usage, 2)}|{round(selected_baseline, 2)}|"
-    f"{grid_stress}|{peak_event}|{round(effective_mandatory_reduction_percent, 2)}|"
-    f"{round(achieved_reduction_percent, 2)}"
+
+customer_requested_within_baseline = requested_usage <= selected_baseline
+
+customer_actually_reduced_load = final_usage < requested_usage
+
+customer_supported_grid_enough = (
+    achieved_reduction_percent >= effective_mandatory_reduction_percent
 )
 
-good_event = (
+voluntary_good_behavior = (
     grid_stress
     and peak_event
-    and achieved_reduction_percent >= effective_mandatory_reduction_percent
-    and final_usage <= selected_baseline
-)
-
-bad_event = (
-    grid_stress
-    and peak_event
-    and achieved_reduction_percent < effective_mandatory_reduction_percent
+    and customer_requested_within_baseline
+    and customer_actually_reduced_load
+    and customer_supported_grid_enough
+    and not refuse_disconnect
+    and not deadline_penalty_active
     and not forced_fair_settlement_active
 )
 
+bad_behavior_event = (
+    grid_stress
+    and peak_event
+    and (
+        requested_usage > selected_baseline
+        or refuse_disconnect
+        or deadline_penalty_active
+        or (
+            effective_mandatory_reduction_percent > 0
+            and achieved_reduction_percent < effective_mandatory_reduction_percent
+        )
+    )
+)
+
+# Important:
+# Do NOT include achieved_reduction_percent in the event id.
+# If it is included, every small load change can create a new event
+# and accidentally increase the streak many times.
+# A good-behavior point should mean:
+# 1) The customer did NOT request usage above their own baseline.
+# 2) The customer did NOT refuse disconnection.
+# 3) The timer did NOT expire.
+# 4) The company did NOT need last-resort forced settlement.
+# 5) The customer actually reduced load.
+# 6) The achieved reduction satisfied the mandatory stress requirement.
+
+behavior_event_id = (
+    f"{selected_person}|"
+    f"baseline={round(selected_baseline, 2)}|"
+    f"requested={round(requested_usage, 2)}|"
+    f"grid={grid_stress}|"
+    f"peak={peak_event}|"
+    f"mandatory={round(effective_mandatory_reduction_percent, 2)}|"
+    f"force={forced_fair_settlement_active}|"
+    f"refuse={refuse_disconnect}|"
+    f"deadline={deadline_penalty_active}"
+)
+
+good_behavior_status_message = "No good-behavior event evaluated."
+
 if behavior_event_id != st.session_state.last_behavior_event_id:
-    if good_event:
+    if voluntary_good_behavior:
         st.session_state.good_behavior_streak += 1
         st.session_state.last_behavior_event_id = behavior_event_id
-    elif bad_event:
+        good_behavior_status_message = (
+            "Good behavior counted: customer stayed within baseline and voluntarily supported the grid."
+        )
+
+    elif bad_behavior_event:
         st.session_state.good_behavior_streak = 0
         st.session_state.last_behavior_event_id = behavior_event_id
+        good_behavior_status_message = (
+            "Good behavior streak reset: customer exceeded baseline, refused, delayed, or failed mandatory support."
+        )
+
+    else:
+        st.session_state.last_behavior_event_id = behavior_event_id
+        good_behavior_status_message = (
+            "No streak change: conditions were neutral or no real voluntary support was detected."
+        )
+else:
+    good_behavior_status_message = (
+        "Same event already evaluated. Streak was not counted again."
+    )
+
 
 # =========================================================
 # MAIN SCADA METRICS
