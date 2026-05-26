@@ -325,6 +325,12 @@ if "ac_unit_states" not in st.session_state:
 if "deadline_started_at" not in st.session_state:
     st.session_state.deadline_started_at = None
 
+if "deadline_penalty_latched" not in st.session_state:
+    st.session_state.deadline_penalty_latched = False
+
+if "deadline_penalty_reason" not in st.session_state:
+    st.session_state.deadline_penalty_reason = ""
+
 if "deadline_signature" not in st.session_state:
     st.session_state.deadline_signature = None
 
@@ -1092,20 +1098,41 @@ def reset_deadline_timer():
     st.session_state.deadline_signature = None
 
 
-def deadline_timer_engine(timer_should_run, deadline_minutes, force_settlement_active, timer_signature=None):
+def reset_deadline_timer(clear_penalty=False):
+    st.session_state.deadline_started_at = None
+    st.session_state.deadline_signature = None
+
+    if clear_penalty:
+        st.session_state.deadline_penalty_latched = False
+        st.session_state.deadline_penalty_reason = ""
+
+
+def deadline_timer_engine(
+    timer_should_run,
+    deadline_minutes,
+    force_settlement_active,
+    timer_signature=None
+):
     now = time.time()
-
-    if force_settlement_active:
-        reset_deadline_timer()
-        return False, "Timer disabled because forced fair settlement is active."
-
-    if not timer_should_run:
-        reset_deadline_timer()
-        return False, "Timer inactive."
 
     if timer_signature is None:
         timer_signature = "default_timer_signature"
 
+    # Last resort must completely disable timer and clear timer penalty.
+    if force_settlement_active:
+        reset_deadline_timer(clear_penalty=True)
+        return False, "Timer disabled because last-resort fair settlement is active."
+
+    # If penalty already expired before, keep it active.
+    if st.session_state.deadline_penalty_latched:
+        return True, st.session_state.deadline_penalty_reason or "Timer already expired. Penalty/enforcement is active."
+
+    # If timer should not run, reset timer countdown but do not create penalty.
+    if not timer_should_run:
+        reset_deadline_timer(clear_penalty=False)
+        return False, "Timer inactive."
+
+    # New timer event.
     if st.session_state.deadline_signature != timer_signature:
         st.session_state.deadline_signature = timer_signature
         st.session_state.deadline_started_at = now
@@ -1119,7 +1146,17 @@ def deadline_timer_engine(timer_should_run, deadline_minutes, force_settlement_a
 
     expired = remaining <= 0
 
-    end_timestamp_ms = int((st.session_state.deadline_started_at + deadline_seconds) * 1000)
+    # If Python detects expiry, latch it permanently.
+    if expired:
+        st.session_state.deadline_penalty_latched = True
+        st.session_state.deadline_penalty_reason = (
+            "Timer expired. Penalty/enforcement is active."
+        )
+        return True, st.session_state.deadline_penalty_reason
+
+    end_timestamp_ms = int(
+        (st.session_state.deadline_started_at + deadline_seconds) * 1000
+    )
 
     components.html(
         f"""
@@ -1145,13 +1182,20 @@ def deadline_timer_engine(timer_should_run, deadline_minutes, force_settlement_a
             let minutes = Math.floor(totalSeconds / 60);
             let seconds = totalSeconds % 60;
 
-            const text = minutes.toString().padStart(2, '0') + ":" + seconds.toString().padStart(2, '0');
+            const text =
+                minutes.toString().padStart(2, '0') +
+                ":" +
+                seconds.toString().padStart(2, '0');
+
             document.getElementById("deadline_timer").innerText = text;
 
             if (diff <= 0) {{
-                document.getElementById("deadline_timer").innerText = "EXPIRED - Penalty/Enforcement Active";
+                document.getElementById("deadline_timer").innerText =
+                    "EXPIRED - Penalty/Enforcement Active";
                 document.getElementById("deadline_timer").style.color = "red";
-                setTimeout(() => window.parent.location.reload(), 1200);
+
+                // Wait a little so user can see EXPIRED, then rerun Streamlit.
+                setTimeout(() => window.parent.location.reload(), 1500);
             }}
         }}
 
@@ -1162,10 +1206,7 @@ def deadline_timer_engine(timer_should_run, deadline_minutes, force_settlement_a
         height=90
     )
 
-    if expired:
-        return True, "Timer expired. Penalty/enforcement is active."
-    else:
-        return False, f"Timer running. Remaining seconds: {int(remaining)}"
+    return False, f"Timer running. Remaining seconds: {int(remaining)}"
 
 
 # =========================================================
@@ -2279,8 +2320,6 @@ billing = billing_engine(
     forced_fair_settlement_active=forced_fair_settlement_active,
     good_behavior_discount_rate=good_behavior_discount_rate
 )
-
-
 
 # =========================================================
 # REPEATED GOOD-BEHAVIOR TRACKING
