@@ -848,6 +848,186 @@ def smart_meter_shed_load(
     df["Disconnected Units"] = 0.0
     df["Remaining Units"] = df["Quantity"].astype(float)
     df["Shed kW"] = 0.0
+    df["Shedding Order"] = ""
+    df["Emergency Shed Rank"] = 999
+
+    if original_load <= 0:
+        return df, 0, 0, 0, "No active load"
+
+    requested_reduction_kw = original_load * requested_reduction_percent / 100
+    mandatory_reduction_kw = original_load * mandatory_minimum_percent / 100
+
+    if force_mode:
+        target_reduction_kw = max(requested_reduction_kw, mandatory_reduction_kw)
+        active_policy = "Company Priority"
+        enforcement_status = (
+            "Last-resort fair settlement is active. Emergency shedding rank was used. "
+            "Heavy machines, washing machines, shed-first loads, and luxury loads are targeted before comfort loads. "
+            "Protected loads were not touched."
+        )
+
+    elif refuse_disconnect:
+        if enforcement_enabled and user_failed_to_respond:
+            target_reduction_kw = mandatory_reduction_kw
+            active_policy = "Company Priority"
+            enforcement_status = (
+                "User refused or ignored request. Mandatory emergency reduction was enforced."
+            )
+        else:
+            target_reduction_kw = 0
+            active_policy = policy_mode
+            enforcement_status = (
+                "No load was disconnected. Premium pricing/timer may apply."
+            )
+
+    else:
+        target_reduction_kw = requested_reduction_kw
+        active_policy = policy_mode
+        enforcement_status = "Smart meter priority was applied."
+
+    if target_reduction_kw <= 0:
+        return df, original_load, original_load, 0, enforcement_status
+
+    if active_policy == "Company Priority":
+        priority_col = "Company Priority"
+    else:
+        priority_col = "User Priority"
+
+    # =====================================================
+    # Emergency shedding rank
+    # =====================================================
+    # Lower rank = disconnected earlier.
+    # This rank is especially important in force_mode.
+    def emergency_shed_rank(row):
+        appliance = str(row.get("Appliance", "")).lower()
+        category = str(row.get("Load Category", ""))
+
+        if bool(row.get("Protected / Never Disconnect", False)) or bool(row.get("Critical", False)):
+            return 999
+
+        # Strongest emergency targets
+        if "heavy" in appliance:
+            return 1
+
+        if "washing" in appliance:
+            return 2
+
+        # Then category-based order
+        if category == "Shed First":
+            return 3
+
+        if category == "Luxury Load":
+            return 4
+
+        if category == "Normal Load":
+            return 5
+
+        if category == "Comfort Load":
+            return 6
+
+        return 7
+
+    df["Emergency Shed Rank"] = df.apply(emergency_shed_rank, axis=1)
+
+    shed_so_far = 0.0
+    order_counter = 1
+
+    candidates = df[
+        (df["Connected"] == True) &
+        (df["Disconnectable"] == True) &
+        (df["Critical"] == False) &
+        (df["Protected / Never Disconnect"] == False)
+    ].copy()
+
+    # =====================================================
+    # Sorting logic
+    # =====================================================
+    # In force mode, use emergency rank first.
+    # This guarantees heavy machines and washing machines
+    # are shed before ACs and power sockets.
+    # =====================================================
+    if force_mode:
+        candidates = candidates.sort_values(
+            by=[
+                "Emergency Shed Rank",
+                priority_col,
+                "Power per Unit kW",
+                "Quantity"
+            ],
+            ascending=[
+                True,
+                True,
+                False,
+                False
+            ]
+        )
+    else:
+        candidates = candidates.sort_values(
+            by=[
+                priority_col,
+                "Power per Unit kW",
+                "Quantity"
+            ],
+            ascending=[
+                True,
+                False,
+                False
+            ]
+        )
+
+    for idx, row in candidates.iterrows():
+        if shed_so_far >= target_reduction_kw:
+            break
+
+        quantity = float(row["Quantity"])
+        power = float(row["Power per Unit kW"])
+        appliance = row["Appliance"]
+        preserve_minimum = float(row["Preserve Minimum Units"])
+
+        # Minimum service protection
+        if minimum_service_enabled:
+            if climate_mode == "Hot Summer - Cooling Priority" and appliance == "ACs":
+                preserve_minimum = max(preserve_minimum, 1)
+
+            if climate_mode == "Cold Winter - Heating Priority" and appliance == "Water Heater":
+                preserve_minimum = max(preserve_minimum, 1)
+
+        max_disconnectable_units = max(quantity - preserve_minimum, 0)
+
+        if max_disconnectable_units <= 0 or power <= 0:
+            continue
+
+        remaining_needed_kw = target_reduction_kw - shed_so_far
+        units_needed = np.ceil(remaining_needed_kw / power)
+
+        units_to_disconnect = min(max_disconnectable_units, units_needed)
+        shed_kw = units_to_disconnect * power
+
+        df.loc[idx, "Disconnected Units"] = units_to_disconnect
+        df.loc[idx, "Remaining Units"] = quantity - units_to_disconnect
+        df.loc[idx, "Shed kW"] = shed_kw
+        df.loc[idx, "Shedding Order"] = f"{order_counter} - Shed"
+
+        shed_so_far += shed_kw
+        order_counter += 1
+
+    final_load = max(original_load - shed_so_far, 0)
+    achieved_reduction_percent = (shed_so_far / original_load) * 100
+
+    # Round for cleaner table display
+    df["Disconnected Units"] = df["Disconnected Units"].round(2)
+    df["Remaining Units"] = df["Remaining Units"].round(2)
+    df["Shed kW"] = df["Shed kW"].round(2)
+    df["Connected Load kW"] = df["Connected Load kW"].round(2)
+
+    return df, original_load, final_load, achieved_reduction_percent, enforcement_status
+    df = calculate_current_connected_load(appliance_df)
+
+    original_load = df["Connected Load kW"].sum()
+
+    df["Disconnected Units"] = 0.0
+    df["Remaining Units"] = df["Quantity"].astype(float)
+    df["Shed kW"] = 0.0
 
     if original_load <= 0:
         return df, 0, 0, 0, "No active load"
@@ -2505,40 +2685,85 @@ st.header("Smart Meter Load Shedding Result")
 st.dataframe(shed_df, use_container_width=True)
 
 st.subheader("Before / After Appliance Quantities")
-qty_view = shed_df[[
-    "Appliance",
-    "Quantity",
-    "Disconnected Units",
-    "Remaining Units",
-    "Power per Unit kW",
-    "Shed kW",
-    "Protected / Never Disconnect",
-    "User Priority",
-    "Company Priority"
-]].copy()
+
+qty_view = shed_df[
+    [
+        "Appliance",
+        "Load Category",
+        "Quantity",
+        "Disconnected Units",
+        "Remaining Units",
+        "Power per Unit kW",
+        "Connected Load kW",
+        "Shed kW",
+        "Emergency Shed Rank",
+        "Shedding Order",
+        "Protected / Never Disconnect",
+        "User Priority",
+        "Company Priority"
+    ]
+].copy()
+
+qty_view = qty_view.sort_values(
+    by=["Shed kW", "Emergency Shed Rank"],
+    ascending=[False, True]
+)
+
 st.dataframe(qty_view, use_container_width=True)
 
+
 fig_units = go.Figure()
+
 fig_units.add_trace(go.Bar(
     x=qty_view["Appliance"],
     y=qty_view["Quantity"],
     name="Before Units",
     marker_color="deepskyblue",
-    text=qty_view["Quantity"]
+    text=qty_view["Quantity"],
+    textposition="auto"
 ))
+
 fig_units.add_trace(go.Bar(
     x=qty_view["Appliance"],
     y=qty_view["Remaining Units"],
     name="After Units",
     marker_color="lime",
-    text=qty_view["Remaining Units"]
+    text=qty_view["Remaining Units"],
+    textposition="auto"
 ))
+
+fig_units.add_trace(go.Bar(
+    x=qty_view["Appliance"],
+    y=qty_view["Shed kW"],
+    name="Shed kW",
+    marker_color="red",
+    text=qty_view["Shed kW"],
+    textposition="auto",
+    yaxis="y2"
+))
+
 fig_units.update_layout(
-    title="Visible Unit Decrease After Shedding / Fair Settlement",
+    title="Visible Unit Decrease and Shed kW After Shedding / Fair Settlement",
     barmode="group",
     template="plotly_dark",
-    height=620
+    height=680,
+    yaxis=dict(
+        title="Units"
+    ),
+    yaxis2=dict(
+        title="Shed kW",
+        overlaying="y",
+        side="right"
+    ),
+    legend=dict(
+        orientation="h",
+        yanchor="bottom",
+        y=1.02,
+        xanchor="center",
+        x=0.5
+    )
 )
+
 st.plotly_chart(fig_units, use_container_width=True)
 
 
@@ -2670,7 +2895,7 @@ condition_rows.append({
 condition_rows.append({
     "Condition": "Priority direction",
     "Active": True,
-    "Rule": "Lower number disconnects earlier; 10 means never disconnect",
+    "Rule": "Lower number disconnects earlier; 6-10 disconnect late; Protected flag means never disconnect",
     "Result": "Heavy/luxury loads shed before protected lights",
     "Status": "Active"
 })
