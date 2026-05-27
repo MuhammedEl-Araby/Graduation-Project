@@ -826,17 +826,8 @@ def apply_household_counts_to_appliance_config(base_config, household_df):
             df.loc[df["Appliance"] == appliance, "Quantity"] = qty
             df.loc[df["Appliance"] == appliance, "Connected"] = qty > 0
 
-            # Critical light fix:
-            # If Person A/B enters 20 lamps, the smart meter table shows 20 lamps,
-            # and all 20 are preserved because lights are protected.
-            if appliance == "Lights":
-                df.loc[df["Appliance"] == appliance, "Load Category"] = "Critical / Never Disconnect"
-                df.loc[df["Appliance"] == appliance, "Protected / Never Disconnect"] = True
-                df.loc[df["Appliance"] == appliance, "Critical"] = True
-                df.loc[df["Appliance"] == appliance, "Disconnectable"] = False
-                df.loc[df["Appliance"] == appliance, "Preserve Minimum Units"] = qty
-
     return apply_load_category_priority_rules(df)
+
 
 def smart_meter_shed_load(
     appliance_df,
@@ -851,7 +842,6 @@ def smart_meter_shed_load(
     force_mode=False
 ):
     df = calculate_current_connected_load(appliance_df)
-
     original_load = df["Connected Load kW"].sum()
 
     df["Disconnected Units"] = 0.0
@@ -873,10 +863,8 @@ def smart_meter_shed_load(
         target_reduction_kw = max(requested_reduction_kw, mandatory_reduction_kw)
         active_policy = "Company Priority"
         enforcement_status = (
-            "Last-resort fair settlement is active. No-name-bias priority shedding is active. "
-            "Within the same priority, the largest remaining kW is selected first. "
-            "If everything is exactly equal, exact ties rotate instead of using appliance name. "
-            "Protected loads were not touched."
+            "Last-resort fair settlement is active. Manual-data no-bias shedding is active. "
+            "The actual appliance table values are used. Same-priority exact ties rotate instead of using appliance name."
         )
     elif refuse_disconnect:
         if enforcement_enabled and user_failed_to_respond:
@@ -892,16 +880,11 @@ def smart_meter_shed_load(
         active_policy = policy_mode
         enforcement_status = "Smart meter priority was applied."
 
-    if active_policy == "Company Priority":
-        priority_col = "Company Priority"
-    else:
-        priority_col = "User Priority"
+    priority_col = "Company Priority" if active_policy == "Company Priority" else "User Priority"
 
-    # Explanation rank only. Actual force-mode shedding uses Effective Shed Priority.
     def emergency_shed_rank(row):
         appliance = str(row.get("Appliance", "")).lower()
         category = str(row.get("Load Category", ""))
-
         if bool(row.get("Protected / Never Disconnect", False)) or bool(row.get("Critical", False)):
             return 999
         if "heavy" in appliance or "washing" in appliance:
@@ -934,19 +917,15 @@ def smart_meter_shed_load(
     ].copy()
 
     preserve_minimum_by_idx = {}
-
     for idx, row in candidates.iterrows():
         preserve_minimum = float(row["Preserve Minimum Units"])
         appliance = row["Appliance"]
-
         if minimum_service_enabled:
             if climate_mode == "Hot Summer - Cooling Priority" and appliance == "ACs":
                 preserve_minimum = max(preserve_minimum, 1)
             if climate_mode == "Cold Winter - Heating Priority" and appliance == "Water Heater":
                 preserve_minimum = max(preserve_minimum, 1)
-
         preserve_minimum_by_idx[idx] = preserve_minimum
-
         if float(row["Quantity"]) <= preserve_minimum:
             df.loc[idx, "Shed Explanation"] = "Not shed: preserved minimum service leaves no disconnectable units."
         else:
@@ -963,12 +942,11 @@ def smart_meter_shed_load(
         while shed_so_far < target_reduction_kw:
             available_rows = []
             for idx, row in candidates.iterrows():
-                quantity_remaining = float(df.loc[idx, "Remaining Units"])
+                remaining_units = float(df.loc[idx, "Remaining Units"])
                 preserve_minimum = preserve_minimum_by_idx.get(idx, 0)
                 power = float(row["Power per Unit kW"])
-                if quantity_remaining > preserve_minimum and power > 0:
+                if remaining_units > preserve_minimum and power > 0:
                     available_rows.append(idx)
-
             if not available_rows:
                 break
 
@@ -986,19 +964,12 @@ def smart_meter_shed_load(
             tier_df["Already Disconnected Units"] = tier_df.index.map(lambda i: float(df.loc[i, "Disconnected Units"]))
             tier_df["Power Sort"] = tier_df["Power per Unit kW"].astype(float)
 
-            # Sort by electrical logic only. Do not use appliance name here.
+            # Electrical order only. Appliance name is intentionally NOT used.
             tier_df = tier_df.sort_values(
-                by=[
-                    "Current Remaining Load kW",
-                    "Already Shed kW",
-                    "Already Disconnected Units",
-                    "Power Sort",
-                    "Remaining Disconnectable Units"
-                ],
+                by=["Current Remaining Load kW", "Already Shed kW", "Already Disconnected Units", "Power Sort", "Remaining Disconnectable Units"],
                 ascending=[False, True, True, False, False]
             )
 
-            # Exact tie detection after all real electrical rules.
             best_row = tier_df.iloc[0]
             tie_df = tier_df[
                 (tier_df["Current Remaining Load kW"] == best_row["Current Remaining Load kW"]) &
@@ -1008,11 +979,10 @@ def smart_meter_shed_load(
                 (tier_df["Remaining Disconnectable Units"] == best_row["Remaining Disconnectable Units"])
             ].copy()
 
-            tie_appliance_names = sorted(tie_df["Appliance"].astype(str).tolist())
-            tie_key = "shed_rotation_" + "__".join(tie_appliance_names)
+            tie_names = sorted(tie_df["Appliance"].astype(str).tolist())
+            tie_key = "shed_rotation_" + "__".join(tie_names)
             if tie_key not in st.session_state:
                 st.session_state[tie_key] = 0
-
             chosen_position = int(st.session_state[tie_key] % len(tie_df))
             chosen_idx = int(tie_df.index[chosen_position])
             st.session_state[tie_key] += 1
@@ -1025,31 +995,22 @@ def smart_meter_shed_load(
             df.loc[chosen_idx, "Remaining Units"] -= 1
             df.loc[chosen_idx, "Shed kW"] += chosen_power
             df.loc[chosen_idx, "Remaining Load kW"] = df.loc[chosen_idx, "Remaining Units"] * chosen_power
-
             if df.loc[chosen_idx, "Shedding Order"] == "":
                 df.loc[chosen_idx, "Shedding Order"] = f"{order_counter} - First Shed"
                 order_counter += 1
 
+            tie_note = ""
             if len(tie_df) > 1:
-                tie_note = (
-                    f" Exact tie detected between: {', '.join(tie_df['Appliance'].astype(str).tolist())}. "
-                    "Selection used tie-rotation, not alphabetical order."
-                )
-            else:
-                tie_note = ""
-
+                tie_note = f" Exact tie detected between: {', '.join(tie_df['Appliance'].astype(str).tolist())}. Selection used tie-rotation."
             df.loc[chosen_idx, "Shed Explanation"] = (
                 f"Shed by force mode from priority {chosen_priority}. "
-                f"Before this step, this load had {before_remaining_kw:.2f} kW remaining in the active priority tier. "
+                f"Before this step, this load had {before_remaining_kw:.2f} kW remaining. "
                 f"One unit × {chosen_power:.2f} kW was disconnected." + tie_note
             )
             shed_so_far += chosen_power
 
     else:
-        candidates = candidates.sort_values(
-            by=[priority_col, "Power per Unit kW", "Quantity"],
-            ascending=[True, False, False]
-        )
+        candidates = candidates.sort_values(by=[priority_col, "Power per Unit kW", "Quantity"], ascending=[True, False, False])
         for idx, row in candidates.iterrows():
             if shed_so_far >= target_reduction_kw:
                 break
@@ -1068,10 +1029,7 @@ def smart_meter_shed_load(
             df.loc[idx, "Shed kW"] = shed_kw
             df.loc[idx, "Remaining Load kW"] = df.loc[idx, "Remaining Units"] * power
             df.loc[idx, "Shedding Order"] = f"{order_counter} - Shed"
-            df.loc[idx, "Shed Explanation"] = (
-                f"Shed by {priority_col}: priority {int(row[priority_col])}, "
-                f"{units_to_disconnect:.0f} units × {power:.2f} kW = {shed_kw:.2f} kW."
-            )
+            df.loc[idx, "Shed Explanation"] = f"Shed by {priority_col}: priority {int(row[priority_col])}, {units_to_disconnect:.0f} units × {power:.2f} kW = {shed_kw:.2f} kW."
             shed_so_far += shed_kw
             order_counter += 1
 
@@ -1080,10 +1038,7 @@ def smart_meter_shed_load(
 
     for idx, row in df.iterrows():
         if row.get("Shed Explanation", "") == "Candidate: available for shedding if its priority tier is needed." and float(df.loc[idx, "Disconnected Units"]) == 0:
-            df.loc[idx, "Shed Explanation"] = (
-                "Not shed: target reduction was reached before this load was needed, "
-                "or a lower-number priority tier satisfied the required kW."
-            )
+            df.loc[idx, "Shed Explanation"] = "Not shed: target reduction was reached before this load was needed, or a lower-number priority tier satisfied the required kW."
 
     df["Disconnected Units"] = df["Disconnected Units"].round(2)
     df["Remaining Units"] = df["Remaining Units"].round(2)
@@ -1567,7 +1522,8 @@ If it is ON:
 
 - A user within their own baseline is protected.
 - A user above their own baseline is denied access above the fair limit.
-- Heavy and luxury loads are shed first.
+- The smart meter can use either the editable appliance table or Person A/B household counts.
+- In editable-table mode, your manual Quantity, kW, Load Category, User Priority, and Company Priority are used exactly.
 - Timer is disabled because the system immediately acts.
 
 </div>
@@ -2405,41 +2361,105 @@ if company_force_fair_settlement and grid_stress and peak_event:
         )
 
 
-# Fairness guard: if the customer is already within/below their own baseline,
-# the smart meter must not shed load just because a peak event exists.
-if (
-    fair_conditions["historical_baseline"]
-    and requested_usage <= selected_baseline
-):
-    effective_voluntary_reduction_percent = 0
-    effective_mandatory_reduction_percent = 0
-    forced_fair_settlement_reason = (
-        "Customer is within/below own historical baseline. "
-        "No smart meter shedding is allowed by fairness protection."
-    )
-
 # =========================================================
 # SMART METER SIMULATION
 # =========================================================
 
-use_household_counts_in_smart_meter = st.checkbox(
-    "Use selected household appliance counts in smart meter simulation",
-    value=True,
-    help="This makes Person A/B lamps, ACs, washing machines, and heavy machines appear directly in the smart meter shedding table."
+st.subheader("Smart Meter Data Source")
+
+smart_meter_data_source = st.radio(
+    "Choose which appliance data the smart meter should use",
+    [
+        "Use Smart Meter Override Page editable appliance table",
+        "Use selected Person A/B household counts"
+    ],
+    index=0,
+    horizontal=False,
+    help=(
+        "Choose the editable appliance table if you want your manual changes to Quantity, kW, "
+        "Load Category, User Priority, and Company Priority to control the shedding simulation. "
+        "Choose household counts only if you want Person A/B lamp, AC, washing-machine, and heavy-machine counts to overwrite quantities."
+    )
+)
+
+use_household_counts_in_smart_meter = (
+    smart_meter_data_source == "Use selected Person A/B household counts"
 )
 
 if use_household_counts_in_smart_meter:
-    st.success("Selected household appliance counts are active in the smart meter table.")
-else:
-    st.warning("Selected household appliance counts are NOT active. The table is using the editable default appliance configuration.")
-
-if use_household_counts_in_smart_meter:
+    st.warning(
+        "Household-count mode is active: Person A/B values will overwrite ONLY quantities for Lights, ACs, Washing Machine, and Heavy Machines. "
+        "Power per Unit kW, Load Category, User Priority, and Company Priority still come from the Smart Meter Override Page."
+    )
     simulation_appliance_config = apply_household_counts_to_appliance_config(
         st.session_state.appliance_config,
         selected_household_df
     )
 else:
+    st.success(
+        "Editable-table mode is active: the smart meter uses the exact values from the Smart Meter Override Page. "
+        "No Person A/B household count will overwrite Washing Machine, Heavy Machines, Lights, or AC quantities."
+    )
     simulation_appliance_config = st.session_state.appliance_config.copy()
+
+simulation_appliance_config = apply_load_category_priority_rules(simulation_appliance_config)
+
+st.subheader("Actual Appliance Data Used By Smart Meter Before Shedding")
+actual_config_view = simulation_appliance_config[
+    [
+        "Appliance",
+        "Quantity",
+        "Power per Unit kW",
+        "Connected",
+        "Load Category",
+        "Preserve Minimum Units",
+        "Protected / Never Disconnect",
+        "Disconnectable",
+        "Critical",
+        "User Priority",
+        "Company Priority"
+    ]
+].copy()
+st.dataframe(actual_config_view, use_container_width=True)
+
+# Equality diagnostic for Washing Machine and Heavy Machines.
+wm_hm_debug = actual_config_view[
+    actual_config_view["Appliance"].isin(["Washing Machine", "Heavy Machines"])
+].copy()
+
+if len(wm_hm_debug) == 2:
+    wm_row = wm_hm_debug[wm_hm_debug["Appliance"] == "Washing Machine"].iloc[0]
+    hm_row = wm_hm_debug[wm_hm_debug["Appliance"] == "Heavy Machines"].iloc[0]
+
+    comparison_columns = [
+        "Quantity",
+        "Power per Unit kW",
+        "Connected",
+        "Load Category",
+        "Preserve Minimum Units",
+        "Protected / Never Disconnect",
+        "Disconnectable",
+        "Critical",
+        "User Priority",
+        "Company Priority"
+    ]
+
+    differences = []
+    for col in comparison_columns:
+        if str(wm_row[col]) != str(hm_row[col]):
+            differences.append(f"{col}: Washing Machine={wm_row[col]} | Heavy Machines={hm_row[col]}")
+
+    if differences:
+        diff_text = "\n- ".join(differences)
+        st.warning(
+            "Washing Machine and Heavy Machines are NOT identical in the actual smart-meter input. "
+            "This can explain different shedding behavior:\n\n- " + diff_text
+        )
+    else:
+        st.success(
+            "Washing Machine and Heavy Machines are identical in the actual smart-meter input. "
+            "If both are selected in the same priority tier and exact electrical tie, the no-name-bias rotation logic will rotate between them."
+        )
 
 shed_df, original_load_kw, final_load_kw, achieved_reduction_percent, enforcement_status = smart_meter_shed_load(
     appliance_df=simulation_appliance_config,
@@ -2691,9 +2711,7 @@ qty_view = shed_df[
         "Remaining Load kW",
         "Shed kW",
         "Emergency Shed Rank",
-        "Effective Shed Priority",
         "Shedding Order",
-        "Shed Explanation",
         "Protected / Never Disconnect",
         "User Priority",
         "Company Priority"
@@ -2701,46 +2719,11 @@ qty_view = shed_df[
 ].copy()
 
 qty_view = qty_view.sort_values(
-    by=["Effective Shed Priority", "Shed kW", "Remaining Load kW", "Appliance"]
-    if "Effective Shed Priority" in qty_view.columns
-    else ["Emergency Shed Rank", "Shed kW", "Remaining Load kW", "Appliance"],
-    ascending=[True, False, False, True]
+    by=["Emergency Shed Rank", "Shed kW", "Appliance"],
+    ascending=[True, False, True]
 )
 
 st.dataframe(qty_view, use_container_width=True)
-
-st.subheader("Shedding Calculation Explanation")
-active_priority_used = "Company Priority" if forced_fair_settlement_active else policy_mode
-if requested_usage <= selected_baseline and fair_conditions["historical_baseline"]:
-    st.success(
-        "No shedding calculation was applied because the selected customer is within/below their own historical baseline. "
-        f"Requested usage = {requested_usage:.2f} kWh and baseline = {selected_baseline:.2f} kWh."
-    )
-else:
-    target_kw_display = original_load_kw * effective_voluntary_reduction_percent / 100 if original_load_kw > 0 else 0
-    actual_shed_kw_display = max(original_load_kw - final_load_kw, 0)
-    st.info(
-        f"Priority used: {active_priority_used}. "
-        f"Target reduction = {effective_voluntary_reduction_percent:.2f}% × {original_load_kw:.2f} kW = {target_kw_display:.2f} kW. "
-        f"Actual shed = {actual_shed_kw_display:.2f} kW. "
-        "Within the same priority, largest remaining kW is selected first. If all electrical values are identical, the system rotates between tied appliances instead of using appliance name."
-    )
-
-calc_explanation_view = qty_view[
-    [
-        "Appliance",
-        "Quantity",
-        "Power per Unit kW",
-        "Connected Load kW",
-        "Remaining Load kW",
-        "Disconnected Units",
-        "Shed kW",
-        "Effective Shed Priority",
-        "Shedding Order",
-        "Shed Explanation"
-    ]
-].copy()
-st.dataframe(calc_explanation_view, use_container_width=True)
 
 st.subheader("Unit Reduction Only")
 fig_units = go.Figure()
@@ -2879,6 +2862,8 @@ if company_force_fair_settlement and grid_stress and peak_event:
                     "Disconnected Units": load_row["Disconnected Units"],
                     "After Units": load_row["Remaining Units"],
                     "Shed kW": load_row["Shed kW"],
+                    "Effective Shed Priority": load_row.get("Effective Shed Priority", ""),
+                    "Shed Explanation": load_row.get("Shed Explanation", ""),
                     "Status": "Forced" if surplus_value > 0 else "Protected within baseline"
                 })
 
@@ -2944,7 +2929,7 @@ condition_rows.append({
     "Condition": "Priority direction",
     "Active": True,
     "Rule": "Lower number disconnects earlier; 6-10 disconnect late; Protected flag means never disconnect",
-    "Result": "Same-priority ties rotate; protected loads are skipped",
+    "Result": "Heavy/luxury loads shed before protected lights",
     "Status": "Active"
 })
 
