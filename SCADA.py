@@ -349,6 +349,14 @@ if "last_good_behavior_counted_event" not in st.session_state:
 if "company_force_fair_settlement" not in st.session_state:
     st.session_state.company_force_fair_settlement = False
 
+# Stores the last non-forced scenario so the dashboard can compare
+# BEFORE vs AFTER pressing Company Force Fair Settlement.
+if "last_resort_before_snapshot" not in st.session_state:
+    st.session_state.last_resort_before_snapshot = None
+
+if "last_resort_before_snapshot_id" not in st.session_state:
+    st.session_state.last_resort_before_snapshot_id = None
+
 
 # =========================================================
 # AC OVERLAY POSITIONS - FIXED VERSION
@@ -2552,6 +2560,42 @@ billing = billing_engine(
 )
 
 # =========================================================
+# SAVE BEFORE-LAST-RESORT SNAPSHOT
+# =========================================================
+# When Company Force Fair Settlement is OFF, the current result is saved.
+# If the user later turns the Last Resort switch ON, this saved result is used
+# as the "Before Last Resort" state for the comparison graphs.
+current_snapshot_id = (
+    f"{selected_person}|"
+    f"requested={round(requested_usage, 3)}|"
+    f"baseline={round(selected_baseline, 3)}|"
+    f"grid={grid_stress}|peak={peak_event}|"
+    f"vol={round(effective_voluntary_reduction_percent, 3)}|"
+    f"mandatory={round(effective_mandatory_reduction_percent, 3)}|"
+    f"policy={policy_mode}|"
+    f"data_source={smart_meter_data_source}"
+)
+
+if not last_resort_mode_active:
+    st.session_state.last_resort_before_snapshot = {
+        "snapshot_id": current_snapshot_id,
+        "selected_person": selected_person,
+        "requested_usage": float(requested_usage),
+        "selected_baseline": float(selected_baseline),
+        "original_load_kw": float(original_load_kw),
+        "final_load_kw": float(final_load_kw),
+        "achieved_reduction_percent": float(achieved_reduction_percent),
+        "final_usage": float(final_usage),
+        "final_bill": float(billing["Final Bill"]),
+        "effective_voluntary_reduction_percent": float(effective_voluntary_reduction_percent),
+        "effective_mandatory_reduction_percent": float(effective_mandatory_reduction_percent),
+        "simulation_appliance_config": simulation_appliance_config.copy(),
+        "shed_df": shed_df.copy(),
+        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")
+    }
+    st.session_state.last_resort_before_snapshot_id = current_snapshot_id
+
+# =========================================================
 # REPEATED GOOD-BEHAVIOR TRACKING
 # =========================================================
 
@@ -2723,6 +2767,175 @@ if deadline_penalty_active:
     st.error("Deadline expired. Penalty/enforcement is now active.")
 
 st.info(enforcement_status)
+
+# =========================================================
+# BEFORE / AFTER LAST RESORT COMPARISON
+# =========================================================
+if last_resort_mode_active:
+    st.divider()
+    st.header("Before vs After Last-Resort Fair Settlement")
+
+    before_snapshot = st.session_state.get("last_resort_before_snapshot", None)
+
+    if before_snapshot is None:
+        st.warning(
+            "No saved 'Before Last Resort' snapshot is available yet. "
+            "Turn Company Force Fair Settlement OFF, let the scenario run once, then turn it ON again."
+        )
+    else:
+        st.caption(
+            f"Before snapshot saved at {before_snapshot.get('saved_at', 'unknown time')} "
+            f"for {before_snapshot.get('selected_person', 'unknown client')}."
+        )
+
+        bm1, bm2, bm3, bm4 = st.columns(4)
+        bm1.metric(
+            "Before Final Load",
+            f"{before_snapshot['final_load_kw']:.2f} kW"
+        )
+        bm2.metric(
+            "After Final Load",
+            f"{final_load_kw:.2f} kW",
+            delta=f"{final_load_kw - before_snapshot['final_load_kw']:.2f} kW"
+        )
+        bm3.metric(
+            "Before Final Usage",
+            f"{before_snapshot['final_usage']:.2f} kWh"
+        )
+        bm4.metric(
+            "After Final Usage",
+            f"{final_usage:.2f} kWh",
+            delta=f"{final_usage - before_snapshot['final_usage']:.2f} kWh"
+        )
+
+        before_shed_df = before_snapshot["shed_df"].copy()
+        after_shed_df = shed_df.copy()
+
+        before_compare = before_shed_df[
+            [
+                "Appliance",
+                "Quantity",
+                "Disconnected Units",
+                "Remaining Units",
+                "Connected Load kW",
+                "Shed kW",
+                "Remaining Load kW"
+            ]
+        ].copy()
+        before_compare = before_compare.rename(columns={
+            "Quantity": "Before Quantity",
+            "Disconnected Units": "Before Disconnected Units",
+            "Remaining Units": "Before Remaining Units",
+            "Connected Load kW": "Before Original kW",
+            "Shed kW": "Before Shed kW",
+            "Remaining Load kW": "Before Remaining kW"
+        })
+
+        after_compare = after_shed_df[
+            [
+                "Appliance",
+                "Quantity",
+                "Disconnected Units",
+                "Remaining Units",
+                "Connected Load kW",
+                "Shed kW",
+                "Remaining Load kW"
+            ]
+        ].copy()
+        after_compare = after_compare.rename(columns={
+            "Quantity": "After Quantity",
+            "Disconnected Units": "After Disconnected Units",
+            "Remaining Units": "After Remaining Units",
+            "Connected Load kW": "After Original kW",
+            "Shed kW": "After Shed kW",
+            "Remaining Load kW": "After Remaining kW"
+        })
+
+        last_resort_compare_df = pd.merge(
+            before_compare,
+            after_compare,
+            on="Appliance",
+            how="outer"
+        ).fillna(0)
+
+        last_resort_compare_df["Extra Shed kW After Last Resort"] = (
+            last_resort_compare_df["After Shed kW"] - last_resort_compare_df["Before Shed kW"]
+        ).round(2)
+        last_resort_compare_df["Extra Disconnected Units After Last Resort"] = (
+            last_resort_compare_df["After Disconnected Units"] - last_resort_compare_df["Before Disconnected Units"]
+        ).round(2)
+
+        st.subheader("Last Resort Comparison Table")
+        st.dataframe(last_resort_compare_df, use_container_width=True)
+
+        fig_last_resort_kw = go.Figure()
+        fig_last_resort_kw.add_trace(go.Bar(
+            x=last_resort_compare_df["Appliance"],
+            y=last_resort_compare_df["Before Remaining kW"],
+            name="Before Last Resort Remaining kW",
+            marker_color="deepskyblue",
+            text=last_resort_compare_df["Before Remaining kW"].round(2),
+            textposition="auto"
+        ))
+        fig_last_resort_kw.add_trace(go.Bar(
+            x=last_resort_compare_df["Appliance"],
+            y=last_resort_compare_df["After Remaining kW"],
+            name="After Last Resort Remaining kW",
+            marker_color="lime",
+            text=last_resort_compare_df["After Remaining kW"].round(2),
+            textposition="auto"
+        ))
+        fig_last_resort_kw.add_trace(go.Bar(
+            x=last_resort_compare_df["Appliance"],
+            y=last_resort_compare_df["Extra Shed kW After Last Resort"],
+            name="Extra Shed kW Caused by Last Resort",
+            marker_color="red",
+            text=last_resort_compare_df["Extra Shed kW After Last Resort"].round(2),
+            textposition="auto"
+        ))
+        fig_last_resort_kw.update_layout(
+            title="Before vs After Last-Resort Fair Settlement - Power Impact",
+            xaxis_title="Appliance",
+            yaxis_title="kW",
+            barmode="group",
+            template="plotly_dark",
+            height=620,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5)
+        )
+        st.plotly_chart(fig_last_resort_kw, use_container_width=True)
+
+        fig_last_resort_units = go.Figure()
+        fig_last_resort_units.add_trace(go.Bar(
+            x=last_resort_compare_df["Appliance"],
+            y=last_resort_compare_df["Before Disconnected Units"],
+            name="Before Last Resort Disconnected Units",
+            marker_color="orange",
+            text=last_resort_compare_df["Before Disconnected Units"].round(2),
+            textposition="auto"
+        ))
+        fig_last_resort_units.add_trace(go.Bar(
+            x=last_resort_compare_df["Appliance"],
+            y=last_resort_compare_df["After Disconnected Units"],
+            name="After Last Resort Disconnected Units",
+            marker_color="red",
+            text=last_resort_compare_df["After Disconnected Units"].round(2),
+            textposition="auto"
+        ))
+        fig_last_resort_units.update_layout(
+            title="Before vs After Last-Resort Fair Settlement - Unit Impact",
+            xaxis_title="Appliance",
+            yaxis_title="Disconnected Units",
+            barmode="group",
+            template="plotly_dark",
+            height=560,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5)
+        )
+        st.plotly_chart(fig_last_resort_units, use_container_width=True)
+
+        if st.button("Clear saved Before Last Resort snapshot"):
+            st.session_state.last_resort_before_snapshot = None
+            st.session_state.last_resort_before_snapshot_id = None
+            st.rerun()
 
 
 # =========================================================
