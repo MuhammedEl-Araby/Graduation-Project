@@ -3440,7 +3440,14 @@ if last_resort_mode_active:
         else:
             st.info(load_interpretation)
 
-        st.success(usage_interpretation) if last_resort_usage_kwh <= baseline_kwh else st.warning(usage_interpretation)
+        # Do not use a one-line conditional expression here.
+        # Streamlit can display the returned DeltaGenerator object on the page.
+        # A normal if/else block shows only the alert message and avoids the long
+        # DeltaGenerator(...) text that appeared in the UI.
+        if last_resort_usage_kwh <= baseline_kwh:
+            st.success(usage_interpretation)
+        else:
+            st.warning(usage_interpretation)
 
         st.markdown(
             f"""
