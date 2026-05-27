@@ -349,7 +349,8 @@ if "last_good_behavior_counted_event" not in st.session_state:
 if "company_force_fair_settlement" not in st.session_state:
     st.session_state.company_force_fair_settlement = False
 
-# Stores the last non-forced scenario for before/after Last Resort comparison.
+# Stores the latest non-forced scenario so Last Resort can show a simple
+# BEFORE vs AFTER comparison at the end of the page.
 if "last_resort_before_snapshot" not in st.session_state:
     st.session_state.last_resort_before_snapshot = None
 
@@ -2561,8 +2562,6 @@ billing = billing_engine(
 # =========================================================
 # SAVE BEFORE-LAST-RESORT SNAPSHOT
 # =========================================================
-# Save the last scenario while Last Resort is OFF. When Last Resort is turned ON,
-# this becomes the "Before" state used for the comparison graphs.
 current_snapshot_id = (
     f"{selected_person}|"
     f"requested={round(requested_usage, 3)}|"
@@ -2585,7 +2584,6 @@ if not last_resort_mode_active:
         "achieved_reduction_percent": float(achieved_reduction_percent),
         "final_usage": float(final_usage),
         "final_bill": float(billing["Final Bill"]),
-        "simulation_appliance_config": simulation_appliance_config.copy(),
         "shed_df": shed_df.copy(),
         "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")
     }
@@ -2763,175 +2761,6 @@ if deadline_penalty_active:
     st.error("Deadline expired. Penalty/enforcement is now active.")
 
 st.info(enforcement_status)
-
-# =========================================================
-# BEFORE / AFTER LAST RESORT COMPARISON
-# =========================================================
-if last_resort_mode_active:
-    st.divider()
-    st.header("Before vs After Last-Resort Fair Settlement")
-
-    before_snapshot = st.session_state.get("last_resort_before_snapshot", None)
-
-    if before_snapshot is None:
-        st.warning(
-            "No saved 'Before Last Resort' snapshot is available yet. "
-            "Turn Company Force Fair Settlement OFF, let the scenario run once, then turn it ON again."
-        )
-    else:
-        if before_snapshot.get("snapshot_id", "") != current_snapshot_id:
-            st.warning(
-                "The saved Before Last Resort snapshot may belong to an older or different scenario. "
-                "For a clean comparison, turn Last Resort OFF once with the current inputs, then turn it ON again."
-            )
-
-        st.caption(
-            f"Before snapshot saved at {before_snapshot.get('saved_at', 'unknown time')} "
-            f"for {before_snapshot.get('selected_person', 'unknown client')}."
-        )
-
-        bm1, bm2, bm3, bm4 = st.columns(4)
-        bm1.metric("Before Final Load", f"{before_snapshot['final_load_kw']:.2f} kW")
-        bm2.metric("After Final Load", f"{final_load_kw:.2f} kW", delta=f"{final_load_kw - before_snapshot['final_load_kw']:.2f} kW")
-        bm3.metric("Before Final Usage", f"{before_snapshot['final_usage']:.2f} kWh")
-        bm4.metric("After Final Usage", f"{final_usage:.2f} kWh", delta=f"{final_usage - before_snapshot['final_usage']:.2f} kWh")
-
-        before_shed_df = before_snapshot["shed_df"].copy()
-        after_shed_df = shed_df.copy()
-
-        before_compare = before_shed_df[[
-            "Appliance", "Quantity", "Disconnected Units", "Remaining Units",
-            "Connected Load kW", "Shed kW", "Remaining Load kW"
-        ]].copy().rename(columns={
-            "Quantity": "Before Quantity",
-            "Disconnected Units": "Before Disconnected Units",
-            "Remaining Units": "Before Remaining Units",
-            "Connected Load kW": "Before Original kW",
-            "Shed kW": "Before Shed kW",
-            "Remaining Load kW": "Before Remaining kW"
-        })
-
-        after_compare = after_shed_df[[
-            "Appliance", "Quantity", "Disconnected Units", "Remaining Units",
-            "Connected Load kW", "Shed kW", "Remaining Load kW"
-        ]].copy().rename(columns={
-            "Quantity": "After Quantity",
-            "Disconnected Units": "After Disconnected Units",
-            "Remaining Units": "After Remaining Units",
-            "Connected Load kW": "After Original kW",
-            "Shed kW": "After Shed kW",
-            "Remaining Load kW": "After Remaining kW"
-        })
-
-        last_resort_compare_df = pd.merge(before_compare, after_compare, on="Appliance", how="outer").fillna(0)
-
-        # Do NOT show negative power. A negative difference only means the appliance
-        # was shed less after Last Resort, not that power became negative.
-        last_resort_compare_df["Additional Shed kW By Last Resort"] = (
-            last_resort_compare_df["After Shed kW"] - last_resort_compare_df["Before Shed kW"]
-        ).clip(lower=0).round(2)
-        last_resort_compare_df["Shed kW Reduced / Restored"] = (
-            last_resort_compare_df["Before Shed kW"] - last_resort_compare_df["After Shed kW"]
-        ).clip(lower=0).round(2)
-        last_resort_compare_df["Additional Disconnected Units By Last Resort"] = (
-            last_resort_compare_df["After Disconnected Units"] - last_resort_compare_df["Before Disconnected Units"]
-        ).clip(lower=0).round(2)
-        last_resort_compare_df["Disconnected Units Reduced / Restored"] = (
-            last_resort_compare_df["Before Disconnected Units"] - last_resort_compare_df["After Disconnected Units"]
-        ).clip(lower=0).round(2)
-
-        st.subheader("Last Resort Comparison Table")
-        st.dataframe(last_resort_compare_df, use_container_width=True)
-
-        summary_df = pd.DataFrame({
-            "State": ["Before Last Resort", "After Last Resort"],
-            "Final Connected Load kW": [before_snapshot["final_load_kw"], final_load_kw],
-            "Final Usage kWh": [before_snapshot["final_usage"], final_usage],
-            "Final Bill EGP": [before_snapshot["final_bill"], billing["Final Bill"]],
-            "Achieved Reduction %": [before_snapshot["achieved_reduction_percent"], achieved_reduction_percent]
-        })
-
-        st.subheader("Last Resort Total System Impact")
-        fig_total_impact = go.Figure()
-        fig_total_impact.add_trace(go.Bar(
-            x=summary_df["State"], y=summary_df["Final Connected Load kW"],
-            name="Final Connected Load kW", marker_color="deepskyblue",
-            text=summary_df["Final Connected Load kW"].round(2), textposition="auto"
-        ))
-        fig_total_impact.add_trace(go.Bar(
-            x=summary_df["State"], y=summary_df["Final Usage kWh"],
-            name="Final Usage kWh", marker_color="lime",
-            text=summary_df["Final Usage kWh"].round(2), textposition="auto"
-        ))
-        fig_total_impact.update_layout(
-            title="Before vs After Last Resort - Total System Result",
-            xaxis_title="Scenario State", yaxis_title="Value",
-            barmode="group", template="plotly_dark", height=560,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5)
-        )
-        st.plotly_chart(fig_total_impact, use_container_width=True)
-
-        st.subheader("Last Resort Appliance Impact - Only What Changed")
-        impact_only_df = last_resort_compare_df[
-            (last_resort_compare_df["Additional Shed kW By Last Resort"] > 0) |
-            (last_resort_compare_df["Shed kW Reduced / Restored"] > 0) |
-            (last_resort_compare_df["Additional Disconnected Units By Last Resort"] > 0) |
-            (last_resort_compare_df["Disconnected Units Reduced / Restored"] > 0)
-        ].copy()
-
-        if impact_only_df.empty:
-            st.info(
-                "Last Resort did not change appliance-level shedding compared with the saved before snapshot. "
-                "This can happen if the previous scenario already satisfied the same reduction target."
-            )
-        else:
-            fig_delta_kw = go.Figure()
-            fig_delta_kw.add_trace(go.Bar(
-                x=impact_only_df["Appliance"], y=impact_only_df["Additional Shed kW By Last Resort"],
-                name="Additional Shed kW", marker_color="red",
-                text=impact_only_df["Additional Shed kW By Last Resort"].round(2), textposition="auto"
-            ))
-            fig_delta_kw.add_trace(go.Bar(
-                x=impact_only_df["Appliance"], y=impact_only_df["Shed kW Reduced / Restored"],
-                name="Shed kW Reduced / Restored", marker_color="lime",
-                text=impact_only_df["Shed kW Reduced / Restored"].round(2), textposition="auto"
-            ))
-            fig_delta_kw.update_layout(
-                title="Last Resort Change Only - kW Impact",
-                xaxis_title="Appliance", yaxis_title="kW Change",
-                barmode="group", template="plotly_dark", height=560,
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5)
-            )
-            st.plotly_chart(fig_delta_kw, use_container_width=True)
-
-            fig_delta_units = go.Figure()
-            fig_delta_units.add_trace(go.Bar(
-                x=impact_only_df["Appliance"], y=impact_only_df["Additional Disconnected Units By Last Resort"],
-                name="Additional Disconnected Units", marker_color="red",
-                text=impact_only_df["Additional Disconnected Units By Last Resort"].round(2), textposition="auto"
-            ))
-            fig_delta_units.add_trace(go.Bar(
-                x=impact_only_df["Appliance"], y=impact_only_df["Disconnected Units Reduced / Restored"],
-                name="Disconnected Units Reduced / Restored", marker_color="lime",
-                text=impact_only_df["Disconnected Units Reduced / Restored"].round(2), textposition="auto"
-            ))
-            fig_delta_units.update_layout(
-                title="Last Resort Change Only - Unit Impact",
-                xaxis_title="Appliance", yaxis_title="Unit Change",
-                barmode="group", template="plotly_dark", height=560,
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5)
-            )
-            st.plotly_chart(fig_delta_units, use_container_width=True)
-
-        st.caption(
-            "Note: green restored bars do not mean negative power. They mean an appliance was shed less after Last Resort "
-            "because the forced settlement selected a different priority path."
-        )
-
-        if st.button("Clear saved Before Last Resort snapshot"):
-            st.session_state.last_resort_before_snapshot = None
-            st.session_state.last_resort_before_snapshot_id = None
-            st.rerun()
 
 
 # =========================================================
@@ -3519,6 +3348,117 @@ else:
         "Forced fair settlement is OFF. User refusal or pay-more behavior can trigger the response deadline timer."
     )
 
+
+# =========================================================
+# SIMPLE LAST RESORT BEFORE / AFTER RESULT
+# =========================================================
+if last_resort_mode_active:
+    st.subheader("Simple Before / After Last Resort Result")
+    before_snapshot = st.session_state.get("last_resort_before_snapshot", None)
+
+    if before_snapshot is None:
+        st.warning(
+            "No saved Before Last Resort result yet. Turn Last Resort OFF once, let the current scenario run, then turn Last Resort ON."
+        )
+    else:
+        if before_snapshot.get("snapshot_id", "") != current_snapshot_id:
+            st.warning(
+                "The saved before-result may belong to an older scenario. For a clean result, turn Last Resort OFF once with the current inputs, then turn it ON again."
+            )
+
+        before_final_load = float(before_snapshot["final_load_kw"])
+        after_final_load = float(final_load_kw)
+        before_final_usage = float(before_snapshot["final_usage"])
+        after_final_usage = float(final_usage)
+        load_removed_by_last_resort = max(before_final_load - after_final_load, 0)
+        usage_removed_by_last_resort = max(before_final_usage - after_final_usage, 0)
+
+        lr1, lr2, lr3 = st.columns(3)
+        lr1.metric("Before Last Resort Load", f"{before_final_load:.2f} kW")
+        lr2.metric("After Last Resort Load", f"{after_final_load:.2f} kW")
+        lr3.metric("Load Removed by Last Resort", f"{load_removed_by_last_resort:.2f} kW")
+
+        simple_last_resort_df = pd.DataFrame({
+            "Measure": ["Final Connected Load kW", "Final Usage kWh"],
+            "Before Last Resort": [before_final_load, before_final_usage],
+            "After Last Resort": [after_final_load, after_final_usage],
+            "Reduction Caused by Last Resort": [load_removed_by_last_resort, usage_removed_by_last_resort]
+        })
+
+        fig_simple_last_resort = go.Figure()
+        fig_simple_last_resort.add_trace(go.Bar(
+            x=simple_last_resort_df["Measure"],
+            y=simple_last_resort_df["Before Last Resort"],
+            name="Before Last Resort",
+            marker_color="deepskyblue",
+            text=simple_last_resort_df["Before Last Resort"].round(2),
+            textposition="auto"
+        ))
+        fig_simple_last_resort.add_trace(go.Bar(
+            x=simple_last_resort_df["Measure"],
+            y=simple_last_resort_df["After Last Resort"],
+            name="After Last Resort",
+            marker_color="lime",
+            text=simple_last_resort_df["After Last Resort"].round(2),
+            textposition="auto"
+        ))
+        fig_simple_last_resort.update_layout(
+            title="Last Resort Effect: Before vs After",
+            xaxis_title="System Measure",
+            yaxis_title="Value",
+            barmode="group",
+            template="plotly_dark",
+            height=500,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5)
+        )
+        st.plotly_chart(fig_simple_last_resort, use_container_width=True)
+
+        with st.expander("Optional detailed appliance changes"):
+            before_shed_df = before_snapshot["shed_df"].copy()
+            after_shed_df = shed_df.copy()
+
+            before_compare = before_shed_df[["Appliance", "Disconnected Units", "Shed kW"]].copy().rename(columns={
+                "Disconnected Units": "Before Disconnected Units",
+                "Shed kW": "Before Shed kW"
+            })
+            after_compare = after_shed_df[["Appliance", "Disconnected Units", "Shed kW"]].copy().rename(columns={
+                "Disconnected Units": "After Disconnected Units",
+                "Shed kW": "After Shed kW"
+            })
+
+            appliance_change_df = pd.merge(before_compare, after_compare, on="Appliance", how="outer").fillna(0)
+            appliance_change_df["Additional Shed kW"] = (
+                appliance_change_df["After Shed kW"] - appliance_change_df["Before Shed kW"]
+            ).clip(lower=0).round(2)
+            appliance_change_df["Restored / Less Shed kW"] = (
+                appliance_change_df["Before Shed kW"] - appliance_change_df["After Shed kW"]
+            ).clip(lower=0).round(2)
+            appliance_change_df["Additional Disconnected Units"] = (
+                appliance_change_df["After Disconnected Units"] - appliance_change_df["Before Disconnected Units"]
+            ).clip(lower=0).round(2)
+            appliance_change_df["Restored / Less Disconnected Units"] = (
+                appliance_change_df["Before Disconnected Units"] - appliance_change_df["After Disconnected Units"]
+            ).clip(lower=0).round(2)
+
+            changed_only_df = appliance_change_df[
+                (appliance_change_df["Additional Shed kW"] > 0) |
+                (appliance_change_df["Restored / Less Shed kW"] > 0) |
+                (appliance_change_df["Additional Disconnected Units"] > 0) |
+                (appliance_change_df["Restored / Less Disconnected Units"] > 0)
+            ].copy()
+
+            if changed_only_df.empty:
+                st.info("No appliance-level difference was detected between before and after Last Resort.")
+            else:
+                st.dataframe(changed_only_df, use_container_width=True)
+                st.caption(
+                    "Restored / Less Shed does not mean negative power. It means the appliance was shed less after Last Resort."
+                )
+
+        if st.button("Clear saved Before Last Resort result"):
+            st.session_state.last_resort_before_snapshot = None
+            st.session_state.last_resort_before_snapshot_id = None
+            st.rerun()
 
 # =========================================================
 # FINAL SYSTEM SUMMARY
