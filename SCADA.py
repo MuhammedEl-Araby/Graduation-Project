@@ -873,9 +873,9 @@ def smart_meter_shed_load(
         target_reduction_kw = max(requested_reduction_kw, mandatory_reduction_kw)
         active_policy = "Company Priority"
         enforcement_status = (
-            "Last-resort fair settlement is active. Priority and remaining-load shedding is active. "
-            "Within the same priority, the appliance with the largest remaining kW is selected first. "
-            "If remaining kW is equal, the system alternates using already-shed kW and disconnected units. "
+            "Last-resort fair settlement is active. No-name-bias priority shedding is active. "
+            "Within the same priority, the largest remaining kW is selected first. "
+            "If everything is exactly equal, exact ties rotate instead of using appliance name. "
             "Protected loads were not touched."
         )
     elif refuse_disconnect:
@@ -897,7 +897,7 @@ def smart_meter_shed_load(
     else:
         priority_col = "User Priority"
 
-    # Explanation rank only. This must NOT override the actual priority column.
+    # Explanation rank only. Actual force-mode shedding uses Effective Shed Priority.
     def emergency_shed_rank(row):
         appliance = str(row.get("Appliance", "")).lower()
         category = str(row.get("Load Category", ""))
@@ -960,22 +960,12 @@ def smart_meter_shed_load(
     order_counter = 1
 
     if force_mode:
-        # Correct logic:
-        # 1) Use ACTUAL priority column first. Lower priority number sheds first.
-        # 2) Inside the same priority, choose the appliance with the largest remaining kW.
-        #    Therefore, if Washing Machine has more remaining load than Heavy Machines,
-        #    Washing Machine is selected first.
-        # 3) If remaining kW is equal, alternate by choosing the load with lower already-shed kW
-        #    and lower disconnected unit count.
-        # 4) Appliance name is only the final deterministic tie-breaker.
         while shed_so_far < target_reduction_kw:
             available_rows = []
-
             for idx, row in candidates.iterrows():
                 quantity_remaining = float(df.loc[idx, "Remaining Units"])
                 preserve_minimum = preserve_minimum_by_idx.get(idx, 0)
                 power = float(row["Power per Unit kW"])
-
                 if quantity_remaining > preserve_minimum and power > 0:
                     available_rows.append(idx)
 
@@ -996,19 +986,37 @@ def smart_meter_shed_load(
             tier_df["Already Disconnected Units"] = tier_df.index.map(lambda i: float(df.loc[i, "Disconnected Units"]))
             tier_df["Power Sort"] = tier_df["Power per Unit kW"].astype(float)
 
+            # Sort by electrical logic only. Do not use appliance name here.
             tier_df = tier_df.sort_values(
                 by=[
                     "Current Remaining Load kW",
                     "Already Shed kW",
                     "Already Disconnected Units",
                     "Power Sort",
-                    "Remaining Disconnectable Units",
-                    "Appliance"
+                    "Remaining Disconnectable Units"
                 ],
-                ascending=[False, True, True, False, False, True]
+                ascending=[False, True, True, False, False]
             )
 
-            chosen_idx = int(tier_df.index[0])
+            # Exact tie detection after all real electrical rules.
+            best_row = tier_df.iloc[0]
+            tie_df = tier_df[
+                (tier_df["Current Remaining Load kW"] == best_row["Current Remaining Load kW"]) &
+                (tier_df["Already Shed kW"] == best_row["Already Shed kW"]) &
+                (tier_df["Already Disconnected Units"] == best_row["Already Disconnected Units"]) &
+                (tier_df["Power Sort"] == best_row["Power Sort"]) &
+                (tier_df["Remaining Disconnectable Units"] == best_row["Remaining Disconnectable Units"])
+            ].copy()
+
+            tie_appliance_names = sorted(tie_df["Appliance"].astype(str).tolist())
+            tie_key = "shed_rotation_" + "__".join(tie_appliance_names)
+            if tie_key not in st.session_state:
+                st.session_state[tie_key] = 0
+
+            chosen_position = int(st.session_state[tie_key] % len(tie_df))
+            chosen_idx = int(tie_df.index[chosen_position])
+            st.session_state[tie_key] += 1
+
             chosen_power = float(df.loc[chosen_idx, "Power per Unit kW"])
             chosen_priority = int(df.loc[chosen_idx, "Effective Shed Priority"])
             before_remaining_kw = float(df.loc[chosen_idx, "Remaining Units"]) * chosen_power
@@ -1022,12 +1030,19 @@ def smart_meter_shed_load(
                 df.loc[chosen_idx, "Shedding Order"] = f"{order_counter} - First Shed"
                 order_counter += 1
 
+            if len(tie_df) > 1:
+                tie_note = (
+                    f" Exact tie detected between: {', '.join(tie_df['Appliance'].astype(str).tolist())}. "
+                    "Selection used tie-rotation, not alphabetical order."
+                )
+            else:
+                tie_note = ""
+
             df.loc[chosen_idx, "Shed Explanation"] = (
                 f"Shed by force mode from priority {chosen_priority}. "
                 f"Before this step, this load had {before_remaining_kw:.2f} kW remaining in the active priority tier. "
-                f"One unit × {chosen_power:.2f} kW was disconnected."
+                f"One unit × {chosen_power:.2f} kW was disconnected." + tie_note
             )
-
             shed_so_far += chosen_power
 
     else:
@@ -1035,24 +1050,19 @@ def smart_meter_shed_load(
             by=[priority_col, "Power per Unit kW", "Quantity"],
             ascending=[True, False, False]
         )
-
         for idx, row in candidates.iterrows():
             if shed_so_far >= target_reduction_kw:
                 break
-
             quantity = float(row["Quantity"])
             power = float(row["Power per Unit kW"])
             preserve_minimum = preserve_minimum_by_idx.get(idx, 0)
             max_disconnectable_units = max(quantity - preserve_minimum, 0)
-
             if max_disconnectable_units <= 0 or power <= 0:
                 continue
-
             remaining_needed_kw = target_reduction_kw - shed_so_far
             units_needed = np.ceil(remaining_needed_kw / power)
             units_to_disconnect = min(max_disconnectable_units, units_needed)
             shed_kw = units_to_disconnect * power
-
             df.loc[idx, "Disconnected Units"] = units_to_disconnect
             df.loc[idx, "Remaining Units"] = quantity - units_to_disconnect
             df.loc[idx, "Shed kW"] = shed_kw
@@ -1062,7 +1072,6 @@ def smart_meter_shed_load(
                 f"Shed by {priority_col}: priority {int(row[priority_col])}, "
                 f"{units_to_disconnect:.0f} units × {power:.2f} kW = {shed_kw:.2f} kW."
             )
-
             shed_so_far += shed_kw
             order_counter += 1
 
@@ -1070,10 +1079,7 @@ def smart_meter_shed_load(
     achieved_reduction_percent = (shed_so_far / original_load) * 100
 
     for idx, row in df.iterrows():
-        if (
-            row.get("Shed Explanation", "") == "Candidate: available for shedding if its priority tier is needed."
-            and float(df.loc[idx, "Disconnected Units"]) == 0
-        ):
+        if row.get("Shed Explanation", "") == "Candidate: available for shedding if its priority tier is needed." and float(df.loc[idx, "Disconnected Units"]) == 0:
             df.loc[idx, "Shed Explanation"] = (
                 "Not shed: target reduction was reached before this load was needed, "
                 "or a lower-number priority tier satisfied the required kW."
@@ -1084,7 +1090,6 @@ def smart_meter_shed_load(
     df["Shed kW"] = df["Shed kW"].round(2)
     df["Connected Load kW"] = df["Connected Load kW"].round(2)
     df["Remaining Load kW"] = (df["Remaining Units"] * df["Power per Unit kW"]).round(2)
-
     return df, original_load, final_load, achieved_reduction_percent, enforcement_status
 
 # =========================================================
@@ -2718,7 +2723,7 @@ else:
         f"Priority used: {active_priority_used}. "
         f"Target reduction = {effective_voluntary_reduction_percent:.2f}% × {original_load_kw:.2f} kW = {target_kw_display:.2f} kW. "
         f"Actual shed = {actual_shed_kw_display:.2f} kW. "
-        "Within the same priority, the algorithm chooses the largest remaining kW first; if equal, it balances already-shed kW and disconnected units."
+        "Within the same priority, largest remaining kW is selected first. If all electrical values are identical, the system rotates between tied appliances instead of using appliance name."
     )
 
 calc_explanation_view = qty_view[
@@ -2939,7 +2944,7 @@ condition_rows.append({
     "Condition": "Priority direction",
     "Active": True,
     "Rule": "Lower number disconnects earlier; 6-10 disconnect late; Protected flag means never disconnect",
-    "Result": "Same-priority loads use largest remaining kW first; protected loads are skipped",
+    "Result": "Same-priority ties rotate; protected loads are skipped",
     "Status": "Active"
 })
 
