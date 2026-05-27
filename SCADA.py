@@ -826,8 +826,17 @@ def apply_household_counts_to_appliance_config(base_config, household_df):
             df.loc[df["Appliance"] == appliance, "Quantity"] = qty
             df.loc[df["Appliance"] == appliance, "Connected"] = qty > 0
 
-    return apply_load_category_priority_rules(df)
+            # Important fix for protected lights:
+            # If the household has 20 lamps, the table must show 20,
+            # and preserve minimum units must also become 20.
+            if appliance == "Lights":
+                df.loc[df["Appliance"] == appliance, "Load Category"] = "Critical / Never Disconnect"
+                df.loc[df["Appliance"] == appliance, "Protected / Never Disconnect"] = True
+                df.loc[df["Appliance"] == appliance, "Critical"] = True
+                df.loc[df["Appliance"] == appliance, "Disconnectable"] = False
+                df.loc[df["Appliance"] == appliance, "Preserve Minimum Units"] = qty
 
+    return apply_load_category_priority_rules(df)
 
 def smart_meter_shed_load(
     appliance_df,
@@ -861,8 +870,8 @@ def smart_meter_shed_load(
         target_reduction_kw = max(requested_reduction_kw, mandatory_reduction_kw)
         active_policy = "Company Priority"
         enforcement_status = (
-            "Last-resort fair settlement is active. Balanced emergency shedding is active. "
-            "The system distributes shedding between high-load appliances first, then moves to lower tiers. "
+            "Last-resort fair settlement is active. Balanced round-robin emergency shedding is active. "
+            "Same-tier high-load appliances are shared fairly before moving to lower tiers. "
             "Protected loads were not touched."
         )
     elif refuse_disconnect:
@@ -893,7 +902,7 @@ def smart_meter_shed_load(
     # Protected loads are never shed.
     # Heavy machines and washing machines are placed in the
     # same high-load emergency tier to avoid unfairly shedding
-    # only one appliance type.
+    # only one appliance type when they have similar importance.
     # =====================================================
     def emergency_shed_rank(row):
         appliance = str(row.get("Appliance", "")).lower()
@@ -931,6 +940,7 @@ def smart_meter_shed_load(
 
     # Effective minimum service per appliance.
     preserve_minimum_by_idx = {}
+
     for idx, row in candidates.iterrows():
         preserve_minimum = float(row["Preserve Minimum Units"])
         appliance = row["Appliance"]
@@ -938,6 +948,7 @@ def smart_meter_shed_load(
         if minimum_service_enabled:
             if climate_mode == "Hot Summer - Cooling Priority" and appliance == "ACs":
                 preserve_minimum = max(preserve_minimum, 1)
+
             if climate_mode == "Cold Winter - Heating Priority" and appliance == "Water Heater":
                 preserve_minimum = max(preserve_minimum, 1)
 
@@ -947,14 +958,13 @@ def smart_meter_shed_load(
     order_counter = 1
 
     # =====================================================
-    # Force mode uses balanced unit-by-unit shedding.
-    # It randomly distributes shedding inside the same tier
-    # instead of removing all units from one appliance first.
-    # A fixed seed keeps the dashboard reproducible.
+    # Force mode uses balanced deterministic round-robin shedding.
+    # It does NOT remove all units from one appliance first.
+    # It alternates between same-tier loads using disconnected ratio.
+    # This fixes the case where washing machines and heavy machines
+    # have the same kW/priority but only heavy machines are shed.
     # =====================================================
     if force_mode:
-        rng = np.random.default_rng(42)
-
         while shed_so_far < target_reduction_kw:
             available_rows = []
 
@@ -971,24 +981,37 @@ def smart_meter_shed_load(
 
             available_df = df.loc[available_rows].copy()
 
-            # Select the best current tier only.
+            # Select the best current emergency tier only.
             best_rank = available_df["Emergency Shed Rank"].min()
             tier_df = available_df[available_df["Emergency Shed Rank"] == best_rank].copy()
 
-            # Weighted random: gives higher loads some priority but still distributes fairly.
-            weights = []
-            for idx, row in tier_df.iterrows():
-                remaining_disconnectable = max(
-                    float(df.loc[idx, "Remaining Units"]) - preserve_minimum_by_idx.get(idx, 0),
+            tier_df["Disconnectable Remaining"] = tier_df.index.map(
+                lambda i: max(
+                    float(df.loc[i, "Remaining Units"]) - preserve_minimum_by_idx.get(i, 0),
                     0
                 )
-                power = float(row["Power per Unit kW"])
-                weights.append(max(np.sqrt(power * max(remaining_disconnectable, 1)), 0.01))
+            )
 
-            weights = np.array(weights, dtype=float)
-            weights = weights / weights.sum()
+            tier_df["Disconnected Ratio"] = tier_df.index.map(
+                lambda i: (
+                    float(df.loc[i, "Disconnected Units"]) /
+                    max(float(df.loc[i, "Quantity"]), 1)
+                )
+            )
 
-            chosen_idx = int(rng.choice(tier_df.index.to_numpy(), p=weights))
+            tier_df["Power Sort"] = tier_df["Power per Unit kW"].astype(float)
+
+            # Fair selection rule:
+            # 1) lowest disconnected ratio first
+            # 2) if equal, higher power first
+            # 3) if still equal, more remaining disconnectable units first
+            # 4) if still equal, appliance name for deterministic output
+            tier_df = tier_df.sort_values(
+                by=["Disconnected Ratio", "Power Sort", "Disconnectable Remaining", "Appliance"],
+                ascending=[True, False, False, True]
+            )
+
+            chosen_idx = int(tier_df.index[0])
             chosen_power = float(df.loc[chosen_idx, "Power per Unit kW"])
 
             df.loc[chosen_idx, "Disconnected Units"] += 1
@@ -1022,6 +1045,7 @@ def smart_meter_shed_load(
 
             remaining_needed_kw = target_reduction_kw - shed_so_far
             units_needed = np.ceil(remaining_needed_kw / power)
+
             units_to_disconnect = min(max_disconnectable_units, units_needed)
             shed_kw = units_to_disconnect * power
 
@@ -1040,7 +1064,9 @@ def smart_meter_shed_load(
     df["Remaining Units"] = df["Remaining Units"].round(2)
     df["Shed kW"] = df["Shed kW"].round(2)
     df["Connected Load kW"] = df["Connected Load kW"].round(2)
-    df["Remaining Load kW"] = (df["Remaining Units"] * df["Power per Unit kW"]).round(2)
+    df["Remaining Load kW"] = (
+        df["Remaining Units"] * df["Power per Unit kW"]
+    ).round(2)
 
     return df, original_load, final_load, achieved_reduction_percent, enforcement_status
 
@@ -2368,6 +2394,11 @@ use_household_counts_in_smart_meter = st.checkbox(
 )
 
 if use_household_counts_in_smart_meter:
+    st.success("Selected household appliance counts are active in the smart meter table.")
+else:
+    st.warning("Selected household appliance counts are NOT active. The table is using the editable default appliance configuration.")
+
+if use_household_counts_in_smart_meter:
     simulation_appliance_config = apply_household_counts_to_appliance_config(
         st.session_state.appliance_config,
         selected_household_df
@@ -2633,8 +2664,8 @@ qty_view = shed_df[
 ].copy()
 
 qty_view = qty_view.sort_values(
-    by=["Emergency Shed Rank", "Shed kW", "Appliance"],
-    ascending=[True, False, True]
+    by=["Emergency Shed Rank", "Disconnected Units", "Shed kW", "Appliance"],
+    ascending=[True, False, False, True]
 )
 
 st.dataframe(qty_view, use_container_width=True)
