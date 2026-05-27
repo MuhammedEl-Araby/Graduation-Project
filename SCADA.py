@@ -1522,8 +1522,8 @@ If it is ON:
 
 - A user within their own baseline is protected.
 - A user above their own baseline is denied access above the fair limit.
-- The smart meter can use either the editable appliance table or Person A/B household counts.
-- In editable-table mode, your manual Quantity, kW, Load Category, User Priority, and Company Priority are used exactly.
+- Recommended mode uses Person A/B quantities together with editable Smart Meter kW, categories, and priorities.
+- Exact editable-table mode ignores Person A/B quantities and uses the Smart Meter Override Page table exactly.
 - Timer is disabled because the system immediately acts.
 
 </div>
@@ -2368,41 +2368,77 @@ if company_force_fair_settlement and grid_stress and peak_event:
 st.subheader("Smart Meter Data Source")
 
 smart_meter_data_source = st.radio(
-    "Choose which appliance data the smart meter should use",
+    "Choose which quantities the smart meter should use",
     [
-        "Use Smart Meter Override Page editable appliance table",
-        "Use selected Person A/B household counts"
+        "Use selected Person A/B quantities + editable kW/priority table",
+        "Use Smart Meter Override Page table exactly"
     ],
     index=0,
     horizontal=False,
     help=(
-        "Choose the editable appliance table if you want your manual changes to Quantity, kW, "
-        "Load Category, User Priority, and Company Priority to control the shedding simulation. "
-        "Choose household counts only if you want Person A/B lamp, AC, washing-machine, and heavy-machine counts to overwrite quantities."
+        "Recommended: use Person A/B quantities so the numbers entered in the SCADA Control Center "
+        "become the smart-meter quantities, while kW, Load Category, User Priority, and Company Priority "
+        "still come from the editable Smart Meter Override Page table. "
+        "Choose the exact editable table only if you want to ignore Person A/B appliance counts completely."
     )
 )
 
 use_household_counts_in_smart_meter = (
-    smart_meter_data_source == "Use selected Person A/B household counts"
+    smart_meter_data_source == "Use selected Person A/B quantities + editable kW/priority table"
 )
 
 if use_household_counts_in_smart_meter:
-    st.warning(
-        "Household-count mode is active: Person A/B values will overwrite ONLY quantities for Lights, ACs, Washing Machine, and Heavy Machines. "
-        "Power per Unit kW, Load Category, User Priority, and Company Priority still come from the Smart Meter Override Page."
+    st.success(
+        "Person A/B quantity mode is active: the graph will use the selected client's entered quantities "
+        "for Lights, ACs, Washing Machine, and Heavy Machines. kW, categories, and priorities still come "
+        "from the Smart Meter Override Page editable table."
     )
     simulation_appliance_config = apply_household_counts_to_appliance_config(
         st.session_state.appliance_config,
         selected_household_df
     )
 else:
-    st.success(
-        "Editable-table mode is active: the smart meter uses the exact values from the Smart Meter Override Page. "
-        "No Person A/B household count will overwrite Washing Machine, Heavy Machines, Lights, or AC quantities."
+    st.warning(
+        "Exact editable-table mode is active: Person A/B quantities are ignored. "
+        "The graph will use only the quantities currently saved in the Smart Meter Override Page table."
     )
     simulation_appliance_config = st.session_state.appliance_config.copy()
 
 simulation_appliance_config = apply_load_category_priority_rules(simulation_appliance_config)
+
+# Hard validation: make sure selected Person quantities really reached the simulation table.
+if use_household_counts_in_smart_meter:
+    selected_counts_row = selected_household_df.iloc[0]
+    expected_quantity_map = {
+        "Lights": int(selected_counts_row["lamps"]),
+        "ACs": int(selected_counts_row["acs"]),
+        "Washing Machine": int(selected_counts_row["washing_machine"]),
+        "Heavy Machines": int(selected_counts_row["heavy_machines"]),
+    }
+
+    quantity_mismatch_messages = []
+    for appliance_name, expected_qty in expected_quantity_map.items():
+        if appliance_name in simulation_appliance_config["Appliance"].values:
+            actual_qty = int(
+                simulation_appliance_config.loc[
+                    simulation_appliance_config["Appliance"] == appliance_name,
+                    "Quantity"
+                ].iloc[0]
+            )
+            if actual_qty != expected_qty:
+                quantity_mismatch_messages.append(
+                    f"{appliance_name}: expected {expected_qty}, actual {actual_qty}"
+                )
+
+    if quantity_mismatch_messages:
+        mismatch_text = "\n- ".join(quantity_mismatch_messages)
+        st.error(
+            "Quantity sync error detected before shedding:\n\n- " + mismatch_text
+        )
+    else:
+        st.success(
+            "Quantity sync check passed: selected Person A/B appliance counts are the quantities used by the smart meter."
+        )
 
 st.subheader("Actual Appliance Data Used By Smart Meter Before Shedding")
 actual_config_view = simulation_appliance_config[
