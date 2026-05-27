@@ -1529,9 +1529,10 @@ The last resort settlement button is stronger than user refusal.
 If it is ON:
 
 - A user within their own baseline is protected.
-- A user above their own baseline is denied access above the fair limit.
-- Recommended mode uses Person A/B quantities together with editable Smart Meter kW, categories, and priorities.
-- Exact editable-table mode ignores Person A/B quantities and uses the Smart Meter Override Page table exactly.
+- A user above their own baseline is forced back to the fair baseline limit or below it.
+- The Last Resort comparison shows two modes: Normal Mode result versus Last Resort Mode result.
+- If Last Resort Mode has higher connected kW, it does not mean power was added; it means Normal Mode shed more load than the fair-settlement mode needed.
+- Baseline is measured in kWh, while connected appliance load is measured in kW.
 - Timer is disabled because the system immediately acts.
 
 </div>
@@ -3350,112 +3351,203 @@ else:
 
 
 # =========================================================
-# SIMPLE LAST RESORT BEFORE / AFTER RESULT
+# SIMPLE LAST RESORT MODE COMPARISON
 # =========================================================
+# VERY IMPORTANT EXPLANATION:
+# This is NOT a physical timeline where the load goes:
+#     Before value  -> press Last Resort -> After value
+# Instead, this section compares TWO SEPARATE SIMULATION MODES using the same input scenario:
+#     1) Normal Mode Result: saved while Last Resort was OFF.
+#     2) Last Resort Mode Result: recalculated after Last Resort is ON.
+#
+# Therefore, Last Resort Mode can sometimes show a HIGHER connected kW than Normal Mode.
+# That does not mean Last Resort added power. It means Normal Mode shed more load than the
+# fair-settlement mode needed. The main fairness target is Final Usage kWh compared with
+# the Historical Baseline kWh, not making connected kW exactly equal to the baseline.
 if last_resort_mode_active:
-    st.subheader("Simple Before / After Last Resort Result")
+    st.subheader("Normal Mode vs Last Resort Mode Result")
+
+    st.info(
+        "Important: this section compares two separate calculations, not a continuous physical timeline. "
+        "Normal Mode is the saved result from when Last Resort was OFF. Last Resort Mode is the recalculated result "
+        "after the company fair-settlement control is ON. If Last Resort Mode has a higher kW than Normal Mode, "
+        "it means Normal Mode disconnected more load than Last Resort needed; it does not mean Last Resort added load."
+    )
+
     before_snapshot = st.session_state.get("last_resort_before_snapshot", None)
 
     if before_snapshot is None:
         st.warning(
-            "No saved Before Last Resort result yet. Turn Last Resort OFF once, let the current scenario run, then turn Last Resort ON."
+            "No saved Normal Mode result yet. Turn Last Resort OFF once, let the current scenario run, then turn Last Resort ON."
         )
     else:
         if before_snapshot.get("snapshot_id", "") != current_snapshot_id:
             st.warning(
-                "The saved before-result may belong to an older scenario. For a clean result, turn Last Resort OFF once with the current inputs, then turn it ON again."
+                "The saved Normal Mode result may belong to an older scenario. For the cleanest result, turn Last Resort OFF once "
+                "with the current inputs, then turn it ON again."
             )
 
-        before_final_load = float(before_snapshot["final_load_kw"])
-        after_final_load = float(final_load_kw)
-        before_final_usage = float(before_snapshot["final_usage"])
-        after_final_usage = float(final_usage)
-        load_removed_by_last_resort = max(before_final_load - after_final_load, 0)
-        usage_removed_by_last_resort = max(before_final_usage - after_final_usage, 0)
+        normal_mode_load_kw = float(before_snapshot["final_load_kw"])
+        last_resort_load_kw = float(final_load_kw)
+        normal_mode_usage_kwh = float(before_snapshot["final_usage"])
+        last_resort_usage_kwh = float(final_usage)
+        baseline_kwh = float(selected_baseline)
 
-        lr1, lr2, lr3 = st.columns(3)
-        lr1.metric("Before Last Resort Load", f"{before_final_load:.2f} kW")
-        lr2.metric("After Last Resort Load", f"{after_final_load:.2f} kW")
-        lr3.metric("Load Removed by Last Resort", f"{load_removed_by_last_resort:.2f} kW")
+        load_difference_kw = last_resort_load_kw - normal_mode_load_kw
+        usage_difference_kwh = last_resort_usage_kwh - normal_mode_usage_kwh
+
+        if load_difference_kw > 0:
+            load_interpretation = (
+                f"Last Resort Mode preserved {load_difference_kw:.2f} kW more connected load than Normal Mode. "
+                "This means Normal Mode shed more load than the fair-settlement mode needed."
+            )
+            load_status_color = "info"
+        elif load_difference_kw < 0:
+            load_interpretation = (
+                f"Last Resort Mode removed {abs(load_difference_kw):.2f} kW more connected load than Normal Mode. "
+                "This means Last Resort had to force extra reduction."
+            )
+            load_status_color = "warning"
+        else:
+            load_interpretation = "Both modes ended with the same connected load."
+            load_status_color = "success"
+
+        if last_resort_usage_kwh <= baseline_kwh:
+            usage_interpretation = (
+                f"Last Resort fairness target is satisfied: final usage is {last_resort_usage_kwh:.2f} kWh, "
+                f"which is at or below the baseline of {baseline_kwh:.2f} kWh."
+            )
+        else:
+            usage_interpretation = (
+                f"Last Resort final usage is still above baseline: {last_resort_usage_kwh:.2f} kWh vs baseline {baseline_kwh:.2f} kWh. "
+                "This means more controllable load may be required."
+            )
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Historical Baseline", f"{baseline_kwh:.2f} kWh")
+        c2.metric("Normal Mode Final Usage", f"{normal_mode_usage_kwh:.2f} kWh")
+        c3.metric("Last Resort Mode Final Usage", f"{last_resort_usage_kwh:.2f} kWh")
+
+        c4, c5, c6 = st.columns(3)
+        c4.metric("Normal Mode Final Load", f"{normal_mode_load_kw:.2f} kW")
+        c5.metric("Last Resort Mode Final Load", f"{last_resort_load_kw:.2f} kW")
+        c6.metric("Mode Difference", f"{load_difference_kw:+.2f} kW")
+
+        if load_status_color == "warning":
+            st.warning(load_interpretation)
+        elif load_status_color == "success":
+            st.success(load_interpretation)
+        else:
+            st.info(load_interpretation)
+
+        st.success(usage_interpretation) if last_resort_usage_kwh <= baseline_kwh else st.warning(usage_interpretation)
+
+        st.markdown(
+            f"""
+            **How to read this result:**
+
+            - **Normal Mode Final Load** = original connected load minus what the normal shedding mode disconnected.
+            - **Last Resort Mode Final Load** = original connected load minus what the fair-settlement mode disconnected.
+            - These two values are **two separate mode results**, not step-by-step physical continuation.
+            - The main Last Resort fairness check is:  
+              **Last Resort Final Usage ({last_resort_usage_kwh:.2f} kWh) ≤ Historical Baseline ({baseline_kwh:.2f} kWh)**.
+            """
+        )
 
         simple_last_resort_df = pd.DataFrame({
-            "Measure": ["Final Connected Load kW", "Final Usage kWh"],
-            "Before Last Resort": [before_final_load, before_final_usage],
-            "After Last Resort": [after_final_load, after_final_usage],
-            "Reduction Caused by Last Resort": [load_removed_by_last_resort, usage_removed_by_last_resort]
+            "State": ["Historical Baseline", "Normal Mode Final Usage", "Last Resort Mode Final Usage"],
+            "kWh": [baseline_kwh, normal_mode_usage_kwh, last_resort_usage_kwh]
         })
 
-        fig_simple_last_resort = go.Figure()
-        fig_simple_last_resort.add_trace(go.Bar(
-            x=simple_last_resort_df["Measure"],
-            y=simple_last_resort_df["Before Last Resort"],
-            name="Before Last Resort",
-            marker_color="deepskyblue",
-            text=simple_last_resort_df["Before Last Resort"].round(2),
+        fig_usage_comparison = go.Figure()
+        fig_usage_comparison.add_trace(go.Bar(
+            x=simple_last_resort_df["State"],
+            y=simple_last_resort_df["kWh"],
+            name="Usage compared with baseline",
+            marker_color=["yellow", "deepskyblue", "lime"],
+            text=simple_last_resort_df["kWh"].round(2),
             textposition="auto"
         ))
-        fig_simple_last_resort.add_trace(go.Bar(
-            x=simple_last_resort_df["Measure"],
-            y=simple_last_resort_df["After Last Resort"],
-            name="After Last Resort",
-            marker_color="lime",
-            text=simple_last_resort_df["After Last Resort"].round(2),
-            textposition="auto"
-        ))
-        fig_simple_last_resort.update_layout(
-            title="Last Resort Effect: Before vs After",
-            xaxis_title="System Measure",
-            yaxis_title="Value",
-            barmode="group",
+        fig_usage_comparison.update_layout(
+            title="Last Resort Fairness Check: Baseline vs Normal Mode vs Last Resort Mode",
+            xaxis_title="Scenario Result",
+            yaxis_title="Energy Usage (kWh)",
             template="plotly_dark",
-            height=500,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5)
+            height=520,
+            showlegend=False
         )
-        st.plotly_chart(fig_simple_last_resort, use_container_width=True)
+        st.plotly_chart(fig_usage_comparison, use_container_width=True)
 
-        with st.expander("Optional detailed appliance changes"):
+        with st.expander("Optional: connected-load comparison and appliance details"):
+            st.info(
+                "Connected load is shown in kW. Baseline is shown in kWh. They are related but not the same unit. "
+                "Use this optional section only to understand which mode shed more connected appliance power."
+            )
+
+            load_mode_df = pd.DataFrame({
+                "Mode": ["Normal Mode", "Last Resort Mode"],
+                "Final Connected Load kW": [normal_mode_load_kw, last_resort_load_kw]
+            })
+            fig_load_mode = go.Figure()
+            fig_load_mode.add_trace(go.Bar(
+                x=load_mode_df["Mode"],
+                y=load_mode_df["Final Connected Load kW"],
+                marker_color=["deepskyblue", "lime"],
+                text=load_mode_df["Final Connected Load kW"].round(2),
+                textposition="auto"
+            ))
+            fig_load_mode.update_layout(
+                title="Optional: Connected Load Comparison Between Modes",
+                xaxis_title="Mode",
+                yaxis_title="Connected Load (kW)",
+                template="plotly_dark",
+                height=450,
+                showlegend=False
+            )
+            st.plotly_chart(fig_load_mode, use_container_width=True)
+
             before_shed_df = before_snapshot["shed_df"].copy()
             after_shed_df = shed_df.copy()
 
             before_compare = before_shed_df[["Appliance", "Disconnected Units", "Shed kW"]].copy().rename(columns={
-                "Disconnected Units": "Before Disconnected Units",
-                "Shed kW": "Before Shed kW"
+                "Disconnected Units": "Normal Mode Disconnected Units",
+                "Shed kW": "Normal Mode Shed kW"
             })
             after_compare = after_shed_df[["Appliance", "Disconnected Units", "Shed kW"]].copy().rename(columns={
-                "Disconnected Units": "After Disconnected Units",
-                "Shed kW": "After Shed kW"
+                "Disconnected Units": "Last Resort Mode Disconnected Units",
+                "Shed kW": "Last Resort Mode Shed kW"
             })
 
             appliance_change_df = pd.merge(before_compare, after_compare, on="Appliance", how="outer").fillna(0)
-            appliance_change_df["Additional Shed kW"] = (
-                appliance_change_df["After Shed kW"] - appliance_change_df["Before Shed kW"]
+            appliance_change_df["More Shed by Last Resort kW"] = (
+                appliance_change_df["Last Resort Mode Shed kW"] - appliance_change_df["Normal Mode Shed kW"]
             ).clip(lower=0).round(2)
-            appliance_change_df["Restored / Less Shed kW"] = (
-                appliance_change_df["Before Shed kW"] - appliance_change_df["After Shed kW"]
+            appliance_change_df["Less Shed by Last Resort kW"] = (
+                appliance_change_df["Normal Mode Shed kW"] - appliance_change_df["Last Resort Mode Shed kW"]
             ).clip(lower=0).round(2)
-            appliance_change_df["Additional Disconnected Units"] = (
-                appliance_change_df["After Disconnected Units"] - appliance_change_df["Before Disconnected Units"]
+            appliance_change_df["More Disconnected by Last Resort Units"] = (
+                appliance_change_df["Last Resort Mode Disconnected Units"] - appliance_change_df["Normal Mode Disconnected Units"]
             ).clip(lower=0).round(2)
-            appliance_change_df["Restored / Less Disconnected Units"] = (
-                appliance_change_df["Before Disconnected Units"] - appliance_change_df["After Disconnected Units"]
+            appliance_change_df["Less Disconnected by Last Resort Units"] = (
+                appliance_change_df["Normal Mode Disconnected Units"] - appliance_change_df["Last Resort Mode Disconnected Units"]
             ).clip(lower=0).round(2)
 
             changed_only_df = appliance_change_df[
-                (appliance_change_df["Additional Shed kW"] > 0) |
-                (appliance_change_df["Restored / Less Shed kW"] > 0) |
-                (appliance_change_df["Additional Disconnected Units"] > 0) |
-                (appliance_change_df["Restored / Less Disconnected Units"] > 0)
+                (appliance_change_df["More Shed by Last Resort kW"] > 0) |
+                (appliance_change_df["Less Shed by Last Resort kW"] > 0) |
+                (appliance_change_df["More Disconnected by Last Resort Units"] > 0) |
+                (appliance_change_df["Less Disconnected by Last Resort Units"] > 0)
             ].copy()
 
             if changed_only_df.empty:
-                st.info("No appliance-level difference was detected between before and after Last Resort.")
+                st.info("No appliance-level difference was detected between Normal Mode and Last Resort Mode.")
             else:
                 st.dataframe(changed_only_df, use_container_width=True)
                 st.caption(
-                    "Restored / Less Shed does not mean negative power. It means the appliance was shed less after Last Resort."
+                    "Less Shed by Last Resort does not mean negative power. It means Last Resort chose to shed that appliance less than Normal Mode."
                 )
 
-        if st.button("Clear saved Before Last Resort result"):
+        if st.button("Clear saved Normal Mode result"):
             st.session_state.last_resort_before_snapshot = None
             st.session_state.last_resort_before_snapshot_id = None
             st.rerun()
