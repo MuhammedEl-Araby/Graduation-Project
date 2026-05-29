@@ -1,4 +1,3 @@
-
 import streamlit as st
 import streamlit.components.v1 as components
 import numpy as np
@@ -325,6 +324,9 @@ if "ac_unit_states" not in st.session_state:
 if "deadline_started_at" not in st.session_state:
     st.session_state.deadline_started_at = None
 
+if "deadline_end_at" not in st.session_state:
+    st.session_state.deadline_end_at = None
+
 if "deadline_penalty_latched" not in st.session_state:
     st.session_state.deadline_penalty_latched = False
 
@@ -438,7 +440,7 @@ def ensure_appliance_columns(df):
         df["Power per Unit kW"], errors="coerce"
     ).fillna(0).clip(lower=0)
 
-    # Priority is now only 1 to 10. Protected flag is used instead or displayed.
+    # Priority is now only 1 to 10. Protected flag is used instead of hidden priority numbers.
     for col in ["User Priority", "Company Priority"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(4).clip(PRIORITY_MIN, PRIORITY_MAX).astype(int)
 
@@ -741,7 +743,7 @@ def apply_load_category_priority_rules(appliance_df):
     Important fix:
     - This function no longer overwrites User Priority or Company Priority.
     - User and Company priorities are editable and actually used by shedding.
-    - Critical loads are protected by flags, not by 10.
+    - Critical loads are protected by flags, not by hidden priority numbers.
     """
     df = ensure_appliance_columns(appliance_df)
 
@@ -857,8 +859,8 @@ def smart_meter_shed_load(
     df["Shed kW"] = 0.0
     df["Remaining Load kW"] = df["Connected Load kW"].astype(float)
     df["Shedding Order"] = ""
-    df["Emergency Shed Rank"] = 999
-    df["Effective Shed Priority"] = 999
+    df["Emergency Shed Rank"] = 10
+    df["Effective Shed Priority"] = 10
     df["Shed Explanation"] = ""
 
     if original_load <= 0:
@@ -894,7 +896,7 @@ def smart_meter_shed_load(
         appliance = str(row.get("Appliance", "")).lower()
         category = str(row.get("Load Category", ""))
         if bool(row.get("Protected / Never Disconnect", False)) or bool(row.get("Critical", False)):
-            return 999
+            return 10
         if "heavy" in appliance or "washing" in appliance:
             return 1
         if category == "Shed First":
@@ -1212,13 +1214,9 @@ def billing_engine(
 # TIMER ENGINE
 # =========================================================
 
-def reset_deadline_timer():
-    st.session_state.deadline_started_at = None
-    st.session_state.deadline_signature = None
-
-
 def reset_deadline_timer(clear_penalty=False):
     st.session_state.deadline_started_at = None
+    st.session_state.deadline_end_at = None
     st.session_state.deadline_signature = None
 
     if clear_penalty:
@@ -1232,50 +1230,48 @@ def deadline_timer_engine(
     force_settlement_active,
     timer_signature=None
 ):
+    """
+    Robust Streamlit timer:
+    - Stores deadline_end_at in session_state.
+    - If JS reloads the page after expiry, Python still sees that now >= deadline_end_at.
+    - Once expired, penalty is latched until reset or last-resort settlement clears it.
+    """
     now = time.time()
 
     if timer_signature is None:
         timer_signature = "default_timer_signature"
 
-    # Last resort must completely disable timer and clear timer penalty.
     if force_settlement_active:
         reset_deadline_timer(clear_penalty=True)
         return False, "Timer disabled because last-resort fair settlement is active."
 
-    # If penalty already expired before, keep it active.
     if st.session_state.deadline_penalty_latched:
-        return True, st.session_state.deadline_penalty_reason or "Timer already expired. Penalty/enforcement is active."
+        return True, st.session_state.deadline_penalty_reason or "Timer expired. Penalty/enforcement is active."
 
-    # If timer should not run, reset timer countdown but do not create penalty.
     if not timer_should_run:
         reset_deadline_timer(clear_penalty=False)
         return False, "Timer inactive."
 
-    # New timer event.
-    if st.session_state.deadline_signature != timer_signature:
+    deadline_seconds = max(int(deadline_minutes * 60), 1)
+
+    if (
+        st.session_state.deadline_signature != timer_signature
+        or st.session_state.deadline_started_at is None
+        or st.session_state.deadline_end_at is None
+    ):
         st.session_state.deadline_signature = timer_signature
         st.session_state.deadline_started_at = now
+        st.session_state.deadline_end_at = now + deadline_seconds
 
-    if st.session_state.deadline_started_at is None:
-        st.session_state.deadline_started_at = now
-
-    deadline_seconds = max(int(deadline_minutes * 60), 1)
-    elapsed = now - st.session_state.deadline_started_at
-    remaining = max(deadline_seconds - elapsed, 0)
-
+    remaining = max(st.session_state.deadline_end_at - now, 0)
     expired = remaining <= 0
 
-    # If Python detects expiry, latch it permanently.
     if expired:
         st.session_state.deadline_penalty_latched = True
-        st.session_state.deadline_penalty_reason = (
-            "Timer expired. Penalty/enforcement is active."
-        )
+        st.session_state.deadline_penalty_reason = "Timer expired. Penalty/enforcement is active."
         return True, st.session_state.deadline_penalty_reason
 
-    end_timestamp_ms = int(
-        (st.session_state.deadline_started_at + deadline_seconds) * 1000
-    )
+    end_timestamp_ms = int(st.session_state.deadline_end_at * 1000)
 
     components.html(
         f"""
@@ -1301,19 +1297,12 @@ def deadline_timer_engine(
             let minutes = Math.floor(totalSeconds / 60);
             let seconds = totalSeconds % 60;
 
-            const text =
-                minutes.toString().padStart(2, '0') +
-                ":" +
-                seconds.toString().padStart(2, '0');
-
+            const text = minutes.toString().padStart(2, '0') + ':' + seconds.toString().padStart(2, '0');
             document.getElementById("deadline_timer").innerText = text;
 
             if (diff <= 0) {{
-                document.getElementById("deadline_timer").innerText =
-                    "EXPIRED - Penalty/Enforcement Active";
+                document.getElementById("deadline_timer").innerText = "EXPIRED - Penalty/Enforcement Active";
                 document.getElementById("deadline_timer").style.color = "red";
-
-                // Wait a little so user can see EXPIRED, then rerun Streamlit.
                 setTimeout(() => window.parent.location.reload(), 1500);
             }}
         }}
@@ -1326,7 +1315,6 @@ def deadline_timer_engine(
     )
 
     return False, f"Timer running. Remaining seconds: {int(remaining)}"
-
 
 # =========================================================
 # IMAGE OVERLAY ENGINE
@@ -1793,10 +1781,18 @@ if page == "Crisis Live Simulation":
     st.markdown("""
 <div class="scada-card">
 <div class="big-status">Live Crisis Simulator</div>
-This page shows direct priority shedding without the full billing section.
-It respects protected loads, editable User Priority, editable Company Priority, and minimum service.
+This page tests whether the system has enough <b>controllable</b> load to satisfy a crisis target.
+It no longer reports stable just because the shedding function ran. It compares:
+<br><br>
+<b>Required Shed kW</b> vs <b>Actual Shed kW</b> vs <b>Maximum Controllable Shed kW</b>.
 </div>
     """, unsafe_allow_html=True)
+
+    st.info(
+        "Crisis stability means the actual shed kW reached the requested crisis target. "
+        "If protected loads, preserved minimum service, disconnected appliances, or zero quantities prevent enough shedding, "
+        "the page will show: Crisis target is not fully satisfied."
+    )
 
     c1, c2, c3, c4 = st.columns(4)
 
@@ -1822,8 +1818,67 @@ It respects protected loads, editable User Priority, editable Company Priority, 
     with c4:
         min_service = st.checkbox("Minimum service preservation", value=True)
 
+    st.subheader("Crisis Input Scenario")
+
+    crisis_input_mode = st.radio(
+        "Choose crisis test input",
+        [
+            "Use current Smart Meter Override Page table",
+            "Built-in impossible crisis test: protected/zero controllable load",
+            "Temporary crisis editor only for this page"
+        ],
+        index=0,
+        help=(
+            "Use the built-in impossible test if you specifically want to see the warning: "
+            "Crisis target is not fully satisfied. More controllable load is needed."
+        )
+    )
+
+    base_crisis_config = ensure_appliance_columns(st.session_state.appliance_config.copy())
+
+    if crisis_input_mode == "Built-in impossible crisis test: protected/zero controllable load":
+        crisis_input_df = base_crisis_config.copy()
+        non_protected_mask = crisis_input_df["Load Category"] != "Critical / Never Disconnect"
+        crisis_input_df.loc[non_protected_mask, "Quantity"] = 0
+        crisis_input_df.loc[non_protected_mask, "Connected"] = False
+        crisis_input_df.loc[non_protected_mask, "Preserve Minimum Units"] = 0
+        crisis_input_df = apply_load_category_priority_rules(crisis_input_df)
+        st.warning(
+            "Impossible crisis test is active: non-protected controllable loads are set to zero/disconnected only inside this page. "
+            "This should normally produce the NOT fully satisfied crisis warning."
+        )
+
+    elif crisis_input_mode == "Temporary crisis editor only for this page":
+        st.info(
+            "Edit this temporary crisis table to test edge cases. It does not overwrite the Smart Meter Override Page table."
+        )
+        crisis_input_df = st.data_editor(
+            base_crisis_config,
+            use_container_width=True,
+            num_rows="dynamic",
+            column_config={
+                "Appliance": st.column_config.TextColumn("Appliance"),
+                "Quantity": st.column_config.NumberColumn("Quantity", min_value=0, step=1),
+                "Power per Unit kW": st.column_config.NumberColumn("Power per Unit kW", min_value=0.0, step=0.01),
+                "Connected": st.column_config.CheckboxColumn("Connected"),
+                "Load Category": st.column_config.SelectboxColumn("Load Category", options=LOAD_CATEGORY_OPTIONS),
+                "Allow Company Emergency Control": st.column_config.CheckboxColumn("Allow Company Emergency Control"),
+                "Preserve Minimum Units": st.column_config.NumberColumn("Preserve Minimum Units", min_value=0, step=1),
+                "Protected / Never Disconnect": st.column_config.CheckboxColumn("Protected / Never Disconnect", disabled=True),
+                "Disconnectable": st.column_config.CheckboxColumn("Disconnectable", disabled=True),
+                "Critical": st.column_config.CheckboxColumn("Critical", disabled=True),
+                "User Priority": st.column_config.NumberColumn("User Priority 1-10", min_value=1, max_value=10, step=1),
+                "Company Priority": st.column_config.NumberColumn("Company Priority 1-10", min_value=1, max_value=10, step=1),
+            }
+        )
+        crisis_input_df = apply_load_category_priority_rules(crisis_input_df)
+
+    else:
+        crisis_input_df = apply_load_category_priority_rules(base_crisis_config)
+        st.success("Using the current Smart Meter Override Page appliance table.")
+
     crisis_df, crisis_original_kw, crisis_final_kw, crisis_achieved, crisis_msg = smart_meter_shed_load(
-        appliance_df=st.session_state.appliance_config,
+        appliance_df=crisis_input_df,
         requested_reduction_percent=crisis_reduction,
         policy_mode=crisis_policy,
         refuse_disconnect=False,
@@ -1835,41 +1890,159 @@ It respects protected loads, editable User Priority, editable Company Priority, 
         force_mode=force_crisis
     )
 
-    cm1, cm2, cm3 = st.columns(3)
-    cm1.metric("Original kW", f"{crisis_original_kw:.2f}")
-    cm2.metric("Final kW", f"{crisis_final_kw:.2f}")
-    cm3.metric("Achieved Reduction", f"{crisis_achieved:.2f}%")
+    crisis_required_shed_kw = crisis_original_kw * crisis_reduction / 100 if crisis_original_kw > 0 else 0
+    crisis_actual_shed_kw = max(crisis_original_kw - crisis_final_kw, 0)
 
-    if crisis_achieved >= crisis_reduction:
-        st.success("Crisis target satisfied. Grid is stable in this simulation.")
+    # Feasibility estimate: run a 100% forced shedding pass on the same temporary crisis input.
+    max_crisis_df, max_original_kw, max_final_kw, max_achieved, max_msg = smart_meter_shed_load(
+        appliance_df=crisis_input_df,
+        requested_reduction_percent=100,
+        policy_mode=crisis_policy,
+        refuse_disconnect=False,
+        climate_mode=st.session_state.climate_mode,
+        mandatory_minimum_percent=100,
+        user_failed_to_respond=True,
+        enforcement_enabled=True,
+        minimum_service_enabled=min_service,
+        force_mode=True
+    )
+    crisis_max_controllable_shed_kw = max(max_original_kw - max_final_kw, 0)
+
+    crisis_tolerance_kw = 1e-6
+
+    crisis_no_load = crisis_original_kw <= 0
+    crisis_no_target = crisis_reduction <= 0
+    crisis_physically_possible = crisis_max_controllable_shed_kw + crisis_tolerance_kw >= crisis_required_shed_kw
+    crisis_target_met = crisis_actual_shed_kw + crisis_tolerance_kw >= crisis_required_shed_kw
+    crisis_stable = (not crisis_no_load) and (crisis_no_target or (crisis_physically_possible and crisis_target_met))
+
+    cm1, cm2, cm3, cm4 = st.columns(4)
+    cm1.metric("Original Load", f"{crisis_original_kw:.2f} kW")
+    cm2.metric("Required Shed", f"{crisis_required_shed_kw:.2f} kW")
+    cm3.metric("Actual Shed", f"{crisis_actual_shed_kw:.2f} kW")
+    cm4.metric("Achieved Reduction", f"{crisis_achieved:.2f}%")
+
+    cm5, cm6, cm7 = st.columns(3)
+    cm5.metric("Final Load", f"{crisis_final_kw:.2f} kW")
+    cm6.metric("Max Controllable Shed", f"{crisis_max_controllable_shed_kw:.2f} kW")
+    cm7.metric("Crisis Target", f"{crisis_reduction:.0f}%")
+
+    if crisis_no_load:
+        st.error("Crisis target is not fully satisfied. There is no active connected load to control.")
+    elif crisis_no_target:
+        st.info("No crisis reduction target was requested. Set the crisis target above 0% to test stability.")
+    elif not crisis_physically_possible:
+        st.warning(
+            "Crisis target is not fully satisfied. More controllable load is needed. "
+            f"Required shed is {crisis_required_shed_kw:.2f} kW, but maximum controllable shed is only {crisis_max_controllable_shed_kw:.2f} kW."
+        )
+    elif not crisis_target_met:
+        st.warning(
+            "Crisis target is not fully satisfied. The system had enough theoretical controllable load, "
+            "but the selected shedding policy did not remove enough load. Check priorities, preservation rules, and force mode."
+        )
     else:
-        st.warning("Crisis target is not fully satisfied. More controllable load is needed.")
+        st.success(
+            "Crisis target satisfied. Grid is stable in this simulation because actual shed kW reached the required crisis shed kW."
+        )
 
     st.info(crisis_msg)
-    st.dataframe(crisis_df, use_container_width=True)
 
+    st.subheader("Crisis Result Table")
+    crisis_display_df = crisis_df.copy()
+    if "Remaining Load kW" not in crisis_display_df.columns:
+        crisis_display_df["Remaining Load kW"] = crisis_display_df["Remaining Units"] * crisis_display_df["Power per Unit kW"]
+    st.dataframe(crisis_display_df, use_container_width=True)
+
+    st.subheader("Crisis kW Feasibility Summary")
+    crisis_summary_df = pd.DataFrame([
+        {"Metric": "Original Load kW", "Value": crisis_original_kw},
+        {"Metric": "Required Shed kW", "Value": crisis_required_shed_kw},
+        {"Metric": "Actual Shed kW", "Value": crisis_actual_shed_kw},
+        {"Metric": "Maximum Controllable Shed kW", "Value": crisis_max_controllable_shed_kw},
+        {"Metric": "Final Load kW", "Value": crisis_final_kw},
+    ])
+    st.dataframe(crisis_summary_df, use_container_width=True)
+
+    fig_crisis_kw = go.Figure()
+    fig_crisis_kw.add_trace(go.Bar(
+        x=["Required Shed", "Actual Shed", "Max Controllable Shed"],
+        y=[crisis_required_shed_kw, crisis_actual_shed_kw, crisis_max_controllable_shed_kw],
+        marker_color=["orange", "red" if not crisis_target_met else "lime", "deepskyblue"],
+        text=[round(crisis_required_shed_kw, 2), round(crisis_actual_shed_kw, 2), round(crisis_max_controllable_shed_kw, 2)],
+        textposition="auto"
+    ))
+    fig_crisis_kw.update_layout(
+        title="Crisis Feasibility: Required vs Actual vs Maximum Controllable Shed",
+        xaxis_title="Crisis Metric",
+        yaxis_title="kW",
+        template="plotly_dark",
+        height=520,
+        showlegend=False
+    )
+    st.plotly_chart(fig_crisis_kw, use_container_width=True)
+
+    st.subheader("Unit Reduction Only")
     fig_crisis_units = go.Figure()
     fig_crisis_units.add_trace(go.Bar(
-        x=crisis_df["Appliance"],
-        y=crisis_df["Quantity"],
+        x=crisis_display_df["Appliance"],
+        y=crisis_display_df["Quantity"],
         name="Before Units",
-        marker_color="deepskyblue"
+        marker_color="deepskyblue",
+        text=crisis_display_df["Quantity"],
+        textposition="auto"
     ))
     fig_crisis_units.add_trace(go.Bar(
-        x=crisis_df["Appliance"],
-        y=crisis_df["Remaining Units"],
-        name="After Units",
-        marker_color="lime"
+        x=crisis_display_df["Appliance"],
+        y=crisis_display_df["Disconnected Units"],
+        name="Disconnected Units",
+        marker_color="red",
+        text=crisis_display_df["Disconnected Units"],
+        textposition="auto"
+    ))
+    fig_crisis_units.add_trace(go.Bar(
+        x=crisis_display_df["Appliance"],
+        y=crisis_display_df["Remaining Units"],
+        name="Remaining Units",
+        marker_color="lime",
+        text=crisis_display_df["Remaining Units"],
+        textposition="auto"
     ))
     fig_crisis_units.update_layout(
         title="Live Crisis Unit Reduction",
         barmode="group",
         template="plotly_dark",
-        height=600
+        height=600,
+        yaxis_title="Units"
     )
     st.plotly_chart(fig_crisis_units, use_container_width=True)
 
+    st.subheader("Shed kW by Appliance")
+    fig_shed_kw = px.bar(
+        crisis_display_df,
+        x="Appliance",
+        y="Shed kW",
+        title="Crisis Shed kW by Appliance",
+        text_auto=".2f"
+    )
+    fig_shed_kw.update_layout(template="plotly_dark", height=520, yaxis_title="Shed kW")
+    st.plotly_chart(fig_shed_kw, use_container_width=True)
+
+    with st.expander("Why this crisis result happened"):
+        st.write("Crisis stable:", crisis_stable)
+        st.write("Original load kW:", round(crisis_original_kw, 4))
+        st.write("Required shed kW:", round(crisis_required_shed_kw, 4))
+        st.write("Actual shed kW:", round(crisis_actual_shed_kw, 4))
+        st.write("Maximum controllable shed kW:", round(crisis_max_controllable_shed_kw, 4))
+        st.write("Physically possible:", crisis_physically_possible)
+        st.write("Target met:", crisis_target_met)
+        st.write("Minimum service enabled:", min_service)
+        st.write("Force crisis shedding now:", force_crisis)
+        st.write("Crisis input mode:", crisis_input_mode)
+        st.write("Tip: To force the warning, choose the built-in impossible crisis test or edit all non-protected controllable loads to quantity 0 / connected False.")
+
     st.stop()
+
 
 # =========================================================
 # SMART METER OVERRIDE PAGE
@@ -2313,6 +2486,32 @@ deadline_penalty_active, timer_status = deadline_timer_engine(
     timer_signature=timer_signature
 )
 
+# =========================================================
+# FINAL TIMER PENALTY AUTHORITY
+# =========================================================
+now_for_timer_check = time.time()
+
+if last_resort_mode_active:
+    reset_deadline_timer(clear_penalty=True)
+    deadline_penalty_active = False
+    timer_status = "Timer disabled because last-resort fair settlement is active."
+else:
+    if (
+        st.session_state.get("deadline_end_at") is not None
+        and now_for_timer_check >= st.session_state.deadline_end_at
+        and timer_should_run
+    ):
+        st.session_state.deadline_penalty_latched = True
+        st.session_state.deadline_penalty_reason = "Timer expired. Penalty/enforcement is active."
+
+    deadline_penalty_active = bool(st.session_state.get("deadline_penalty_latched", False))
+
+    if deadline_penalty_active:
+        timer_status = st.session_state.get(
+            "deadline_penalty_reason",
+            "Timer expired. Penalty/enforcement is active."
+        )
+
 if deadline_penalty_active:
     user_failed_to_respond = True
 
@@ -2735,9 +2934,31 @@ e1, e2 = st.columns(2)
 e1.metric("Effective Voluntary Reduction", f"{effective_voluntary_reduction_percent:.2f}%")
 e2.metric("Effective Mandatory Reduction", f"{effective_mandatory_reduction_percent:.2f}%")
 
-e3, e4 = st.columns(2)
+deadline_penalty_active = bool(
+    deadline_penalty_active or st.session_state.get("deadline_penalty_latched", False)
+)
+
+e3, e4, e5 = st.columns(3)
 e3.metric("Forced Fair Settlement", "Active" if forced_fair_settlement_active else "Inactive")
-e4.metric("Timer Penalty", "Active" if deadline_penalty_active else "Inactive")
+
+if last_resort_mode_active:
+    visible_timer_state = "Disabled by Last Resort"
+elif deadline_penalty_active:
+    visible_timer_state = "Expired"
+elif timer_should_run:
+    visible_timer_state = "Running"
+else:
+    visible_timer_state = "Inactive"
+
+e4.metric("Timer Status", visible_timer_state)
+e5.metric("Timer Penalty", "Active" if deadline_penalty_active else "Inactive")
+
+if st.session_state.get("deadline_penalty_latched", False):
+    st.error("Deadline expired. Timer penalty/enforcement is latched active.")
+
+    if st.button("Reset Timer Penalty / Start New Event"):
+        reset_deadline_timer(clear_penalty=True)
+        st.rerun()
 
 st.metric("Repeated Good-Behavior Discount Rate", f"{good_behavior_discount_rate * 100:.0f}%")
 st.info(good_behavior_status_message)
