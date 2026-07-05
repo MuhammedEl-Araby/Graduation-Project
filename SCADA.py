@@ -4,9 +4,9 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.metrics import mean_absolute_error, r2_score, accuracy_score
 from scipy.stats import norm
 from PIL import Image, ImageDraw, ImageFont
 import base64
@@ -546,6 +546,195 @@ model, metrics, training_df = st.session_state.trained_model_bundle
 
 mean_usage = training_df["historical_baseline_kwh"].mean()
 std_usage = training_df["historical_baseline_kwh"].std()
+
+
+# =========================================================
+# SCADA GRID PREDICTIVE / PROTECTIVE MAINTENANCE ENGINE
+# =========================================================
+def generate_grid_maintenance_training_data(n=6000):
+    np.random.seed(77)
+    age = np.random.uniform(0.5, 38, n)
+    live_load_kw = np.random.uniform(0.1, 250, n)
+    loading_percent = np.random.uniform(20, 145, n)
+    peak_stress_percent = np.random.uniform(0, 100, n)
+    voltage_deviation_percent = np.random.uniform(0, 20, n)
+    temperature_c = np.random.uniform(22, 118, n)
+    vibration_mm_s = np.random.uniform(0.1, 15, n)
+    insulation_health_percent = np.random.uniform(5, 100, n)
+    breaker_operations = np.random.randint(0, 9000, n)
+    fault_events_30d = np.random.poisson(2.0, n)
+    humidity_percent = np.random.uniform(15, 100, n)
+    maintenance_quality = np.random.uniform(0.55, 1.25, n)
+    stress_index = (
+        0.025 * loading_percent
+        + 0.020 * peak_stress_percent
+        + 0.120 * voltage_deviation_percent
+        + 0.030 * np.maximum(temperature_c - 55, 0)
+        + 0.320 * vibration_mm_s
+        + 0.003 * breaker_operations
+        + 0.800 * fault_events_30d
+        + 0.010 * humidity_percent
+        + 0.012 * live_load_kw
+        - 0.030 * insulation_health_percent
+    ) / maintenance_quality
+    condition_score = np.clip(
+        100 - 1.35 * age - 2.65 * stress_index - 0.18 * (100 - insulation_health_percent)
+        + np.random.normal(0, 2.5, n),
+        0,
+        100,
+    )
+    remaining_life_months = np.clip(
+        420 - 9.2 * age - 5.7 * stress_index + 0.55 * insulation_health_percent
+        + np.random.normal(0, 16, n),
+        1,
+        480,
+    )
+    failure_risk_12m = (
+        (remaining_life_months <= 12)
+        | (condition_score <= 35)
+        | (stress_index >= 34)
+        | ((fault_events_30d >= 7) & (voltage_deviation_percent >= 8))
+    ).astype(int)
+    return pd.DataFrame({
+        "age_years": age,
+        "live_load_kw": live_load_kw,
+        "loading_percent": loading_percent,
+        "peak_stress_percent": peak_stress_percent,
+        "voltage_deviation_percent": voltage_deviation_percent,
+        "temperature_c": temperature_c,
+        "vibration_mm_s": vibration_mm_s,
+        "insulation_health_percent": insulation_health_percent,
+        "breaker_operations": breaker_operations,
+        "fault_events_30d": fault_events_30d,
+        "humidity_percent": humidity_percent,
+        "maintenance_quality": maintenance_quality,
+        "stress_index": stress_index,
+        "condition_score": condition_score,
+        "remaining_life_months": remaining_life_months,
+        "failure_risk_12m": failure_risk_12m,
+    })
+
+
+def train_grid_maintenance_models():
+    df = generate_grid_maintenance_training_data()
+    features = [
+        "age_years", "live_load_kw", "loading_percent", "peak_stress_percent",
+        "voltage_deviation_percent", "temperature_c", "vibration_mm_s",
+        "insulation_health_percent", "breaker_operations", "fault_events_30d",
+        "humidity_percent", "maintenance_quality"
+    ]
+    X = df[features]
+    y_rul = df["remaining_life_months"]
+    y_risk = df["failure_risk_12m"]
+    X_train, X_test, y_train, y_test = train_test_split(X, y_rul, test_size=0.2, random_state=42)
+    rul_model = RandomForestRegressor(n_estimators=240, max_depth=15, min_samples_leaf=2, random_state=42)
+    rul_model.fit(X_train, y_train)
+    rul_pred = rul_model.predict(X_test)
+    Xc_train, Xc_test, yc_train, yc_test = train_test_split(X, y_risk, test_size=0.2, random_state=42, stratify=y_risk)
+    risk_model = RandomForestClassifier(n_estimators=240, max_depth=14, min_samples_leaf=2, random_state=42)
+    risk_model.fit(Xc_train, yc_train)
+    risk_pred = risk_model.predict(Xc_test)
+    return rul_model, risk_model, {
+        "RUL MAE Months": mean_absolute_error(y_test, rul_pred),
+        "RUL R2": r2_score(y_test, rul_pred),
+        "Risk Accuracy": accuracy_score(yc_test, risk_pred),
+    }, df, features
+
+
+if "grid_maintenance_bundle" not in st.session_state:
+    st.session_state.grid_maintenance_bundle = train_grid_maintenance_models()
+
+maintenance_rul_model, maintenance_risk_model, maintenance_metrics, maintenance_training_df, maintenance_features = st.session_state.grid_maintenance_bundle
+
+
+def calculate_grid_asset_condition(age_years, live_load_kw, loading_percent, peak_stress_percent, voltage_deviation_percent, temperature_c, vibration_mm_s, insulation_health_percent, breaker_operations, fault_events_30d, humidity_percent, maintenance_quality):
+    stress_index = (
+        0.025 * loading_percent + 0.020 * peak_stress_percent + 0.120 * voltage_deviation_percent
+        + 0.030 * max(temperature_c - 55, 0) + 0.320 * vibration_mm_s
+        + 0.003 * breaker_operations + 0.800 * fault_events_30d + 0.010 * humidity_percent
+        + 0.012 * live_load_kw - 0.030 * insulation_health_percent
+    ) / max(maintenance_quality, 0.1)
+    condition_score = np.clip(100 - 1.35 * age_years - 2.65 * stress_index - 0.18 * (100 - insulation_health_percent), 0, 100)
+    return float(condition_score), float(stress_index)
+
+
+def classify_grid_maintenance_state(condition_score, risk_probability, remaining_life_months):
+    if condition_score <= 25 or risk_probability >= 0.75 or remaining_life_months <= 6:
+        return "Functional Failure Zone", "Critical", "Emergency protective maintenance or replacement is required now."
+    if condition_score <= 45 or risk_probability >= 0.50 or remaining_life_months <= 12:
+        return "Potential Failure P", "Danger", "Schedule predictive maintenance before the P-F interval closes."
+    if condition_score <= 65 or risk_probability >= 0.25 or remaining_life_months <= 30:
+        return "Degradation Started", "Warning", "Plan protective maintenance and increase SCADA monitoring frequency."
+    return "Normal State", "Healthy", "Continue SCADA monitoring and normal inspection cycle."
+
+
+def simulate_grid_maintenance_curves(condition_score, stress_index, maintenance_day, restoration_strength, degradation_speed, horizon_days):
+    days = np.arange(0, horizon_days + 1)
+    rate = max(0.018, (100 - condition_score + stress_index) / 2600) * degradation_speed
+    no_maintenance = np.clip(condition_score - rate * (days ** 1.32), 0, 100)
+    normal_life = np.clip(condition_score - (rate * 0.46) * days, 0, 100)
+    predictive = no_maintenance.copy()
+    for i, day in enumerate(days):
+        if day >= maintenance_day:
+            restored = min(100, no_maintenance[i] + restoration_strength)
+            predictive[i] = np.clip(restored - (rate * 0.33) * (day - maintenance_day), 0, 100)
+    time_based = np.zeros_like(days, dtype=float)
+    interval = max(int(maintenance_day / 2), 20)
+    last_restore_day = 0
+    restored_level = condition_score
+    for i, day in enumerate(days):
+        if day > 0 and day % interval == 0:
+            restored_level = min(100, time_based[i - 1] + restoration_strength * 0.55)
+            last_restore_day = day
+        time_based[i] = np.clip(restored_level - (rate * 0.52) * (day - last_restore_day), 0, 100)
+    breakdown = no_maintenance.copy()
+    fail_days = np.where(breakdown <= 45)[0]
+    breakdown_day = int(fail_days[0]) if len(fail_days) > 0 else None
+    if breakdown_day is not None:
+        for i, day in enumerate(days):
+            if day >= breakdown_day:
+                breakdown[i] = np.clip(35 - 0.18 * (day - breakdown_day), 0, 100)
+    curve_df = pd.DataFrame({
+        "Day": days,
+        "No Maintenance": no_maintenance,
+        "Normal Life Expectancy": normal_life,
+        "Predictive Maintenance": predictive,
+        "Time-Based Maintenance": time_based,
+        "Breakdown Maintenance": breakdown,
+        "Failure Threshold": np.full_like(days, 45, dtype=float),
+        "Potential Failure Threshold": np.full_like(days, 60, dtype=float),
+    })
+    p_days = curve_df[curve_df["No Maintenance"] <= 60]["Day"]
+    f_days = curve_df[curve_df["No Maintenance"] <= 45]["Day"]
+    d_days = curve_df[curve_df["No Maintenance"] <= 80]["Day"]
+    points = {
+        "td": int(d_days.iloc[0]) if len(d_days) > 0 else None,
+        "p": int(p_days.iloc[0]) if len(p_days) > 0 else None,
+        "f": int(f_days.iloc[0]) if len(f_days) > 0 else None,
+        "breakdown": breakdown_day,
+    }
+    return curve_df, points
+
+
+def draw_grid_pf_curve(curve_df, points):
+    fig = go.Figure()
+    td, tp, tf = points["td"], points["p"], points["f"]
+    normal = curve_df.copy(); warn = curve_df.copy(); danger = curve_df.copy()
+    normal.loc[normal["Day"] > (td if td is not None else 0), "No Maintenance"] = np.nan
+    warn.loc[(warn["Day"] < (td if td is not None else 0)) | (warn["Day"] > (tp if tp is not None else curve_df["Day"].max())), "No Maintenance"] = np.nan
+    danger.loc[danger["Day"] < (tp if tp is not None else curve_df["Day"].max()), "No Maintenance"] = np.nan
+    fig.add_trace(go.Scatter(x=normal["Day"], y=normal["No Maintenance"], mode="lines", name="Normal State", line=dict(color="lime", width=6)))
+    fig.add_trace(go.Scatter(x=warn["Day"], y=warn["No Maintenance"], mode="lines", name="Degradation / Warning State", line=dict(color="gold", width=6)))
+    fig.add_trace(go.Scatter(x=danger["Day"], y=danger["No Maintenance"], mode="lines", name="Dangerous State", line=dict(color="red", width=6)))
+    for label, day, color in [("td", td, "lime"), ("P", tp, "gold"), ("F", tf, "red")]:
+        if day is not None:
+            yv = float(curve_df.loc[curve_df["Day"] == day, "No Maintenance"].iloc[0])
+            fig.add_trace(go.Scatter(x=[day], y=[yv], mode="markers+text", name=label, marker=dict(size=22, color=color, line=dict(width=3, color="black")), text=[label], textposition="top center"))
+            fig.add_vline(x=day, line_dash="dot", line_color=color)
+    fig.add_hline(y=60, line_dash="dash", line_color="gold", annotation_text="Potential Failure Threshold")
+    fig.add_hline(y=45, line_dash="dash", line_color="red", annotation_text="Functional Failure Threshold")
+    fig.update_layout(title="SCADA P-F Curve: Normal State → Dangerous State → Functional Failure", xaxis_title="Time / Operating Days", yaxis_title="Grid Asset Condition / Performance", template="plotly_dark", height=620, yaxis=dict(range=[0,105]))
+    return fig
 
 
 # =========================================================
@@ -1448,6 +1637,7 @@ page = st.radio(
         "Smart Meter Override Page",
         "Real Life Simulation",
         "Crisis Live Simulation",
+        "Predictive Maintenance",
         "How To Use",
         "AI & Model Details"
     ],
@@ -1466,6 +1656,8 @@ with st.sidebar:
     st.header("Model Performance")
     st.metric("MAE", f"{metrics['MAE']:.2f} kWh")
     st.metric("Model Score R²", f"{metrics['R2']:.2f}")
+    st.metric("Maintenance RUL MAE", f"{maintenance_metrics['RUL MAE Months']:.1f} months")
+    st.metric("Maintenance Risk Accuracy", f"{maintenance_metrics['Risk Accuracy']:.2f}")
 
     st.divider()
 
@@ -1484,6 +1676,125 @@ with st.sidebar:
         st.session_state.last_behavior_event_id = None
         st.rerun()
 
+
+# =========================================================
+# PREDICTIVE MAINTENANCE PAGE
+# =========================================================
+if page == "Predictive Maintenance":
+    st.title("Machine Learning Predictive & Protective Maintenance")
+    st.markdown("""
+<div class="scada-card">
+<div class="big-status">SCADA Grid Asset Maintenance Simulator</div>
+This page is linked to the SCADA smart meter table. It predicts asset condition, remaining useful life,
+12-month failure risk, P-F failure points, and protective maintenance benefit.
+</div>
+    """, unsafe_allow_html=True)
+
+    live_load_df = calculate_current_connected_load(st.session_state.appliance_config)
+    live_connected_load_kw = float(live_load_df["Connected Load kW"].sum())
+
+    left_col, right_col = st.columns([0.34, 0.66])
+    with left_col:
+        st.subheader("SCADA Case Study Inputs")
+        asset_type = st.selectbox("Grid Asset Type", ["Distribution Transformer", "Feeder Cable", "Circuit Breaker", "Switchgear", "Main Distribution Panel"], index=0)
+        use_live_load = st.checkbox("Use current Smart Meter connected load as grid load input", value=True)
+        if use_live_load:
+            live_load_kw = st.number_input("Connected Grid Load kW from SCADA", min_value=0.0, value=float(round(live_connected_load_kw, 2)), step=0.1)
+        else:
+            live_load_kw = st.number_input("Manual Connected Grid Load kW", min_value=0.0, value=25.0, step=0.5)
+        age_years = st.slider("Asset Age (years)", 0.0, 40.0, 12.0, 0.5)
+        loading_percent = st.slider("Asset Loading (%)", 10.0, 150.0, 82.0, 1.0)
+        peak_stress_percent = st.slider("Peak Stress / Overload Severity (%)", 0.0, 100.0, 45.0, 1.0)
+        voltage_deviation_percent = st.slider("Voltage Deviation (%)", 0.0, 20.0, 4.5, 0.1)
+        temperature_c = st.slider("Asset Temperature (°C)", 20.0, 120.0, 68.0, 1.0)
+        vibration_mm_s = st.slider("Vibration / Mechanical Stress (mm/s)", 0.0, 15.0, 3.2, 0.1)
+        insulation_health_percent = st.slider("Insulation / Oil Health (%)", 0.0, 100.0, 72.0, 1.0)
+        breaker_operations = st.slider("Breaker / Switching Operations", 0, 9000, 1200, 50)
+        fault_events_30d = st.slider("Fault Events in Last 30 Days", 0, 25, 2, 1)
+        humidity_percent = st.slider("Humidity (%)", 10.0, 100.0, 60.0, 1.0)
+        maintenance_quality = st.slider("Maintenance Quality Factor", 0.50, 1.30, 0.95, 0.01)
+        st.subheader("Protective Maintenance Controls")
+        maintenance_day = st.slider("Planned Predictive Maintenance Day", 1, 730, 120, 1)
+        restoration_strength = st.slider("Maintenance Restoration Strength", 0.0, 55.0, 24.0, 1.0)
+        degradation_speed = st.slider("Case Study Degradation Speed", 0.20, 3.00, 1.00, 0.05)
+        horizon_days = st.slider("Simulation Horizon Days", 120, 1095, 730, 30)
+
+    feature_row = pd.DataFrame([{
+        "age_years": age_years,
+        "live_load_kw": live_load_kw,
+        "loading_percent": loading_percent,
+        "peak_stress_percent": peak_stress_percent,
+        "voltage_deviation_percent": voltage_deviation_percent,
+        "temperature_c": temperature_c,
+        "vibration_mm_s": vibration_mm_s,
+        "insulation_health_percent": insulation_health_percent,
+        "breaker_operations": breaker_operations,
+        "fault_events_30d": fault_events_30d,
+        "humidity_percent": humidity_percent,
+        "maintenance_quality": maintenance_quality,
+    }])
+    predicted_rul_months = float(maintenance_rul_model.predict(feature_row[maintenance_features])[0])
+    risk_probability = float(maintenance_risk_model.predict_proba(feature_row[maintenance_features])[0][1])
+    condition_score, stress_index = calculate_grid_asset_condition(age_years, live_load_kw, loading_percent, peak_stress_percent, voltage_deviation_percent, temperature_c, vibration_mm_s, insulation_health_percent, breaker_operations, fault_events_30d, humidity_percent, maintenance_quality)
+    asset_state, severity_level, recommendation = classify_grid_maintenance_state(condition_score, risk_probability, predicted_rul_months)
+    curve_df, points = simulate_grid_maintenance_curves(condition_score, stress_index, maintenance_day, restoration_strength, degradation_speed, horizon_days)
+
+    with right_col:
+        st.subheader("Machine Learning Prediction Result")
+        a, b, c, d = st.columns(4)
+        a.metric("Asset Condition", f"{condition_score:.1f}/100")
+        b.metric("Predicted RUL", f"{predicted_rul_months:.1f} months")
+        c.metric("12-Month Failure Risk", f"{risk_probability * 100:.1f}%")
+        d.metric("Stress Index", f"{stress_index:.2f}")
+        if severity_level == "Critical":
+            st.error(f"{asset_type}: {asset_state}. {recommendation}")
+        elif severity_level == "Danger":
+            st.warning(f"{asset_type}: {asset_state}. {recommendation}")
+        elif severity_level == "Warning":
+            st.info(f"{asset_type}: {asset_state}. {recommendation}")
+        else:
+            st.success(f"{asset_type}: {asset_state}. {recommendation}")
+        st.dataframe(pd.DataFrame([
+            {"Point": "td - Degradation Start", "Day": points["td"], "Meaning": "First measurable degradation from normal operation"},
+            {"Point": "P - Potential Failure", "Day": points["p"], "Meaning": "Fault symptoms are visible; predictive maintenance should act here"},
+            {"Point": "F - Functional Failure", "Day": points["f"], "Meaning": "Asset can no longer perform the required function"},
+            {"Point": "Planned Predictive Maintenance", "Day": maintenance_day, "Meaning": "Selected intervention timing"},
+        ]), use_container_width=True)
+
+    st.divider()
+    st.subheader("P-F Curve: Normal State, Dangerous State, Potential Failure, Functional Failure")
+    st.plotly_chart(draw_grid_pf_curve(curve_df, points), use_container_width=True)
+
+    st.subheader("Protective Maintenance Strategy Graph")
+    fig_strategy = go.Figure()
+    fig_strategy.add_trace(go.Scatter(x=curve_df["Day"], y=curve_df["Normal Life Expectancy"], mode="lines", name="Normal Life Expectancy", line=dict(color="royalblue", width=4)))
+    fig_strategy.add_trace(go.Scatter(x=curve_df["Day"], y=curve_df["No Maintenance"], mode="lines", name="No Maintenance", line=dict(color="orangered", width=4, dash="dash")))
+    fig_strategy.add_trace(go.Scatter(x=curve_df["Day"], y=curve_df["Predictive Maintenance"], mode="lines", name="Predictive Maintenance", line=dict(color="mediumseagreen", width=5)))
+    fig_strategy.add_trace(go.Scatter(x=curve_df["Day"], y=curve_df["Time-Based Maintenance"], mode="lines", name="Time-Based Maintenance", line=dict(color="gray", width=3)))
+    fig_strategy.add_trace(go.Scatter(x=curve_df["Day"], y=curve_df["Breakdown Maintenance"], mode="lines", name="Breakdown Maintenance", line=dict(color="firebrick", width=3, dash="dot")))
+    fig_strategy.add_trace(go.Scatter(x=curve_df["Day"], y=curve_df["Failure Threshold"], mode="lines", name="Failure Threshold", line=dict(color="red", width=2, dash="dash")))
+    fig_strategy.add_vline(x=maintenance_day, line_width=3, line_dash="dot", line_color="yellow", annotation_text="Predictive Maintenance Action")
+    fig_strategy.update_layout(title="Protective Maintenance Strategy Comparison", xaxis_title="Time / Operating Days", yaxis_title="Equipment Condition / Performance", template="plotly_dark", height=660, yaxis=dict(range=[0,105]))
+    st.plotly_chart(fig_strategy, use_container_width=True)
+
+    st.subheader("SCADA Maintenance Prediction Dataset Row")
+    display_feature_row = feature_row.copy()
+    display_feature_row["Predicted RUL Months"] = predicted_rul_months
+    display_feature_row["Failure Risk Probability"] = risk_probability
+    display_feature_row["Condition Score"] = condition_score
+    display_feature_row["Stress Index"] = stress_index
+    display_feature_row["Asset State"] = asset_state
+    st.dataframe(display_feature_row, use_container_width=True)
+
+    st.subheader("ML Feature Importance for Remaining Useful Life")
+    feature_importance_df = pd.DataFrame({"SCADA Feature": maintenance_features, "Importance": maintenance_rul_model.feature_importances_}).sort_values("Importance", ascending=False)
+    fig_importance = px.bar(feature_importance_df, x="SCADA Feature", y="Importance", title="SCADA Signals Influencing Predicted Remaining Useful Life", text_auto=".3f")
+    fig_importance.update_layout(template="plotly_dark", height=520)
+    st.plotly_chart(fig_importance, use_container_width=True)
+
+    st.subheader("Maintenance Curve Data")
+    st.dataframe(curve_df, use_container_width=True)
+    st.stop()
 
 # =========================================================
 # HOW TO USE PAGE
