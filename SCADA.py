@@ -176,6 +176,26 @@ GOOD_BEHAVIOR_STEP_DISCOUNT = 0.02
 GOOD_BEHAVIOR_MAX_DISCOUNT = 0.12
 CHARITY_MEDICAL_DEVICE_DISCOUNT_RATE = 0.25
 FAIRNESS_INACTIVE_ADJUSTMENT_RATE = 0.01
+
+# Saudi monthly consumption tariff rates in SAR/kWh
+SAUDI_TIER_LIMIT_KWH = 6000
+RESIDENTIAL_TIER1_RATE = 0.18
+RESIDENTIAL_TIER2_RATE = 0.30
+COMMERCIAL_TIER1_RATE = 0.22
+COMMERCIAL_TIER2_RATE = 0.32
+CHARITY_TIER1_RATE = 0.16
+CHARITY_TIER2_RATE = 0.20
+SAUDI_VAT_RATE = 0.15
+DEFAULT_RESIDENTIAL_METER_FEE = 10.0
+DEFAULT_COMMERCIAL_METER_FEE = 15.0
+SAUDI_APARTMENT_LOW_KWH = 800
+SAUDI_APARTMENT_HIGH_KWH = 1500
+SAUDI_VILLA_LOW_KWH = 2000
+SAUDI_VILLA_HIGH_KWH = 4000
+SAUDI_AVERAGE_HOME_LOW_KWH = 2000
+SAUDI_AVERAGE_HOME_HIGH_KWH = 2500
+COMPANY_GROWTH_DISCOUNT_RATE = 0.10
+
 PRIORITY_MIN = 1
 PRIORITY_MAX = 10
 
@@ -881,50 +901,13 @@ def style_status_cells(status_df):
 # =========================================================
 
 def calculate_engineering_baseline(input_df):
-    row = input_df.iloc[0].astype(float)
-
-    engineering_baseline = (
-        0.10 * row["lamps"] +
-        1.15 * row["acs"] +
-        0.90 * row["washing_machine"] +
-        1.55 * row["heavy_machines"] +
-        0.32 * row["occupants"] +
-        0.010 * row["house_size"]
-    )
-
-    return max(engineering_baseline, 0.5)
-
+    return estimate_saudi_monthly_baseline_from_household(input_df)
 
 def predict_historical_baseline(model, input_df):
-    ml_prediction = float(model.predict(input_df.astype(float))[0])
-    engineering_prediction = calculate_engineering_baseline(input_df)
-
-    row = input_df.iloc[0].astype(float)
-
-    extreme_score = 0
-
-    if row["lamps"] > 300:
-        extreme_score += 1
-    if row["acs"] > 80:
-        extreme_score += 1
-    if row["washing_machine"] > 60:
-        extreme_score += 1
-    if row["heavy_machines"] > 80:
-        extreme_score += 1
-    if row["occupants"] > 150:
-        extreme_score += 1
-    if row["house_size"] > 6000:
-        extreme_score += 1
-
-    if extreme_score == 0:
-        final_prediction = 0.60 * ml_prediction + 0.40 * engineering_prediction
-    elif extreme_score <= 2:
-        final_prediction = 0.30 * ml_prediction + 0.70 * engineering_prediction
-    else:
-        final_prediction = engineering_prediction
-
-    return max(final_prediction, 0.5)
-
+    # Saudi monthly baseline is estimated with property size, occupants and device mix.
+    # The previous synthetic Random Forest remains for model details, but billing baseline
+    # uses the Saudi-oriented engineering estimator to avoid unrealistic low kWh values.
+    return max(calculate_engineering_baseline(input_df), 0.5)
 
 
 # =========================================================
@@ -932,35 +915,43 @@ def predict_historical_baseline(model, input_df):
 # =========================================================
 def company_statistical_baseline(household_df, historical_baseline):
     row = household_df.iloc[0].astype(float)
-    engineering_baseline = calculate_engineering_baseline(household_df)
     occupants = max(row["occupants"], 1)
     size = max(row["house_size"], 1)
     area_per_person = size / occupants
-    density_adjustment = 1.0
-    if area_per_person < 12:
-        density_adjustment += 0.10
-    elif area_per_person > 80:
-        density_adjustment -= 0.08
-    device_intensity = row["acs"] * 1.15 + row["washing_machine"] * 0.9 + row["heavy_machines"] * 1.55 + row["lamps"] * 0.10
-    reasonable_company_baseline = max(0.5, engineering_baseline * 1.15 * density_adjustment + 0.04 * device_intensity)
-    company_approved_baseline = min(historical_baseline, reasonable_company_baseline)
-    fraud_gap = max(historical_baseline - reasonable_company_baseline, 0)
-    fraud_risk_percent = min((fraud_gap / max(reasonable_company_baseline, 0.1)) * 100, 100)
+
+    statistical_baseline = calculate_engineering_baseline(household_df)
+
+    if size <= 180:
+        expected_band = f"Apartment expected range {SAUDI_APARTMENT_LOW_KWH}-{SAUDI_APARTMENT_HIGH_KWH} kWh/month"
+        expected_high = SAUDI_APARTMENT_HIGH_KWH + max(row["acs"] - 2, 0) * 450
+    else:
+        expected_band = f"Villa expected range {SAUDI_VILLA_LOW_KWH}-{SAUDI_VILLA_HIGH_KWH} kWh/month"
+        expected_high = SAUDI_VILLA_HIGH_KWH + max(row["acs"] - 4, 0) * 550 + max(size - 350, 0) * 5
+
+    company_approved_baseline = min(historical_baseline, statistical_baseline)
+    inflation_gap = max(historical_baseline - statistical_baseline, 0)
+    abnormal_usage_gap = max(statistical_baseline - expected_high, 0)
+    fraud_gap = max(inflation_gap, abnormal_usage_gap)
+    fraud_risk_percent = min((fraud_gap / max(statistical_baseline, 0.1)) * 100, 100)
+
     if fraud_risk_percent >= 35:
-        fraud_status = "High baseline inflation risk"
+        fraud_status = "High baseline inflation / abnormal usage risk"
     elif fraud_risk_percent >= 15:
-        fraud_status = "Medium baseline inflation risk"
+        fraud_status = "Medium baseline review required"
     else:
         fraud_status = "Normal baseline"
+
     return {
         "Historical Baseline kWh": historical_baseline,
-        "Company Statistical Baseline kWh": reasonable_company_baseline,
+        "Company Statistical Baseline kWh": statistical_baseline,
         "Company Approved Baseline kWh": company_approved_baseline,
+        "Expected Saudi Property Band": expected_band,
         "Fraud Gap kWh": fraud_gap,
         "Fraud Risk %": fraud_risk_percent,
         "Fraud Status": fraud_status,
         "Area per Occupant m²": area_per_person,
     }
+
 
 # =========================================================
 # HOUSEHOLD INPUT
@@ -1421,6 +1412,155 @@ def smart_meter_shed_load(
     df["Remaining Load kW"] = (df["Remaining Units"] * df["Power per Unit kW"]).round(2)
     return df, original_load, final_load, achieved_reduction_percent, enforcement_status
 
+
+# =========================================================
+# SAUDI TARIFF AND STATIC COMPOUND ENGINE
+# =========================================================
+def calculate_saudi_tariff_breakdown(kwh, category="Residential", meter_fee=None, include_vat=False):
+    kwh = max(float(kwh), 0.0)
+    category_key = str(category).strip().lower()
+
+    if category_key == "commercial":
+        tier1_rate = COMMERCIAL_TIER1_RATE
+        tier2_rate = COMMERCIAL_TIER2_RATE
+        default_meter_fee = DEFAULT_COMMERCIAL_METER_FEE
+    elif category_key in ["charity", "charitable", "charitable institution"]:
+        tier1_rate = CHARITY_TIER1_RATE
+        tier2_rate = CHARITY_TIER2_RATE
+        default_meter_fee = DEFAULT_RESIDENTIAL_METER_FEE
+    else:
+        tier1_rate = RESIDENTIAL_TIER1_RATE
+        tier2_rate = RESIDENTIAL_TIER2_RATE
+        default_meter_fee = DEFAULT_RESIDENTIAL_METER_FEE
+
+    if meter_fee is None:
+        meter_fee = default_meter_fee
+
+    tier1_kwh = min(kwh, SAUDI_TIER_LIMIT_KWH)
+    tier2_kwh = max(kwh - SAUDI_TIER_LIMIT_KWH, 0)
+    tier1_charge = tier1_kwh * tier1_rate
+    tier2_charge = tier2_kwh * tier2_rate
+    energy_charge = tier1_charge + tier2_charge
+    subtotal = energy_charge + meter_fee
+    vat = subtotal * SAUDI_VAT_RATE if include_vat else 0.0
+    total = subtotal + vat
+
+    return {
+        "Category": category,
+        "kWh": kwh,
+        "Tier 1 kWh": tier1_kwh,
+        "Tier 2 kWh": tier2_kwh,
+        "Tier 1 Rate SAR/kWh": tier1_rate,
+        "Tier 2 Rate SAR/kWh": tier2_rate,
+        "Tier 1 Charge SAR": tier1_charge,
+        "Tier 2 Charge SAR": tier2_charge,
+        "Energy Charge SAR": energy_charge,
+        "Meter Fee SAR": meter_fee,
+        "VAT SAR": vat,
+        "Total Bill SAR": total,
+    }
+
+
+def estimate_saudi_monthly_baseline_from_household(household_df):
+    row = household_df.iloc[0].astype(float)
+    lamps = row["lamps"]
+    acs = row["acs"]
+    washing = row["washing_machine"]
+    heavy = row["heavy_machines"]
+    occupants = max(row["occupants"], 1)
+    size = max(row["house_size"], 1)
+
+    # Monthly Saudi-oriented estimator. It anchors apartments near 800-1500 kWh,
+    # standard villas near 2000-4000 kWh, then adds device and density effects.
+    if size <= 180:
+        shell_baseline = 650 + 3.2 * size + 120 * occupants
+        property_floor = SAUDI_APARTMENT_LOW_KWH
+        property_soft_cap = SAUDI_APARTMENT_HIGH_KWH + max(acs - 2, 0) * 450
+    elif size <= 350:
+        shell_baseline = 1250 + 4.8 * size + 180 * occupants
+        property_floor = SAUDI_VILLA_LOW_KWH
+        property_soft_cap = SAUDI_VILLA_HIGH_KWH + max(acs - 4, 0) * 550
+    else:
+        shell_baseline = 1800 + 5.5 * size + 220 * occupants
+        property_floor = SAUDI_VILLA_LOW_KWH + 500
+        property_soft_cap = 6500 + max(acs - 5, 0) * 600
+
+    device_baseline = lamps * 6 + acs * 430 + washing * 120 + heavy * 350
+    density_factor = 1.0
+    area_per_occupant = size / occupants
+    if area_per_occupant < 15:
+        density_factor += 0.08
+    elif area_per_occupant > 90:
+        density_factor -= 0.07
+
+    estimated = (shell_baseline + device_baseline) * density_factor
+    estimated = max(estimated, property_floor)
+    estimated = min(estimated, property_soft_cap)
+    return max(estimated, 0.5)
+
+
+def build_static_compound_summary():
+    rows = []
+
+    static_assets = [
+        {
+            "Compound Asset": "8 Villas",
+            "Meters": 8,
+            "Units per Meter": 1,
+            "Category": "Residential",
+            "Monthly kWh per Meter": 3000,
+            "Note": "Standard villa assumption inside Saudi range 2,000-4,000 kWh/month",
+        },
+        {
+            "Compound Asset": "3 Apartment Blocks",
+            "Meters": 36,
+            "Units per Meter": 1,
+            "Category": "Residential",
+            "Monthly kWh per Meter": 1200,
+            "Note": "Static assumption: 12 apartments per block, 1,200 kWh/month per apartment",
+        },
+        {
+            "Compound Asset": "Club House",
+            "Meters": 1,
+            "Units per Meter": 1,
+            "Category": "Commercial",
+            "Monthly kWh per Meter": 6500,
+            "Note": "Club house treated as commercial with usage crossing 6,000 kWh/month",
+        },
+    ]
+
+    for item in static_assets:
+        breakdown = calculate_saudi_tariff_breakdown(
+            item["Monthly kWh per Meter"],
+            category=item["Category"],
+            include_vat=False,
+        )
+        meters = item["Meters"]
+        rows.append({
+            **item,
+            "Total Monthly kWh": item["Monthly kWh per Meter"] * meters,
+            "Tier 1 kWh per Meter": breakdown["Tier 1 kWh"],
+            "Tier 2 kWh per Meter": breakdown["Tier 2 kWh"],
+            "Monthly Bill per Meter SAR": breakdown["Total Bill SAR"],
+            "Total Monthly Bill SAR": breakdown["Total Bill SAR"] * meters,
+        })
+
+    df = pd.DataFrame(rows)
+    total_row = {
+        "Compound Asset": "TOTAL COMPOUND",
+        "Meters": df["Meters"].sum(),
+        "Units per Meter": "",
+        "Category": "Mixed",
+        "Monthly kWh per Meter": "",
+        "Total Monthly kWh": df["Total Monthly kWh"].sum(),
+        "Tier 1 kWh per Meter": "",
+        "Tier 2 kWh per Meter": "",
+        "Monthly Bill per Meter SAR": "",
+        "Total Monthly Bill SAR": df["Total Monthly Bill SAR"].sum(),
+        "Note": "Static compound total",
+    }
+    return pd.concat([df, pd.DataFrame([total_row])], ignore_index=True)
+
 # =========================================================
 # BILLING ENGINE
 # =========================================================
@@ -1443,12 +1583,11 @@ def billing_engine(
     premium_usage = max(final_usage - baseline, 0)
     normal_usage = min(final_usage, baseline)
 
-    no_action_bill = (
-        min(requested_usage, baseline) * BASE_RATE +
-        max(requested_usage - baseline, 0) * (PREMIUM_PRESERVATION_RATE if grid_stress else BASE_RATE)
-    )
+    final_tariff = calculate_saudi_tariff_breakdown(final_usage, category="Residential", include_vat=False)
+    no_action_tariff = calculate_saudi_tariff_breakdown(requested_usage, category="Residential", include_vat=False)
 
-    bill = normal_usage * BASE_RATE
+    no_action_bill = no_action_tariff["Total Bill SAR"]
+    bill = final_tariff["Total Bill SAR"]
 
     bonus = 0
     penalty = 0
@@ -1458,26 +1597,15 @@ def billing_engine(
     loyalty_discount = 0
     good_behavior_discount = 0
     penalty_waived = 0
+    company_growth_discount = 0
     status = []
-
-    if (
-        fair_conditions["growth_bonus"]
-        and new_company_growth_mode
-        and not grid_stress
-    ):
-        if final_usage > mean_usage:
-            bonus = bill * BONUS_RATE
-            bill -= bonus
-            status.append("Growth bonus applied because the company wants to increase average demand.")
-        else:
-            status.append("Growth mode active, but usage is still below desired growth level.")
 
     if grid_stress:
         if fair_conditions["marginal_premium"]:
             if premium_usage > 0:
-                premium_charge = premium_usage * PREMIUM_PRESERVATION_RATE
+                premium_charge = premium_usage * (RESIDENTIAL_TIER2_RATE + 0.10)
                 bill += premium_charge
-                status.append("Premium pricing applied only to usage above the customer's own historical baseline.")
+                status.append("Premium pricing applied only to usage above the company-approved baseline.")
         else:
             if final_usage > baseline:
                 premium_charge = final_usage * 0.30
@@ -1486,6 +1614,7 @@ def billing_engine(
 
     penalty_should_apply = (
         grid_stress
+        and mandatory_reduction_percent > 0
         and achieved_reduction_percent < mandatory_reduction_percent
         and not forced_fair_settlement_active
     )
@@ -1504,22 +1633,22 @@ def billing_engine(
         if fair_conditions["progressive_penalty"]:
             shortfall = mandatory_reduction_percent - achieved_reduction_percent
             shortfall_ratio = shortfall / max(mandatory_reduction_percent, 1)
-            penalty = final_usage * 0.20 * shortfall_ratio
+            penalty = final_tariff["Energy Charge SAR"] * 0.20 * shortfall_ratio
             status.append("Progressive penalty applied based on reduction shortfall.")
         else:
-            penalty = final_usage * 0.20
+            penalty = final_tariff["Energy Charge SAR"] * 0.20
             status.append("Flat grid stress penalty applied because mandatory reduction was not achieved.")
-
         bill += penalty
 
     if deadline_penalty_active and not forced_fair_settlement_active:
-        timer_penalty = final_usage * 0.25
+        timer_penalty = final_tariff["Energy Charge SAR"] * 0.25
         bill += timer_penalty
-        status.append("Deadline penalty applied because the user refused or delayed response after the timer expired.")
+        status.append("Deadline/ignored-request penalty applied because the user delayed or ignored company requests during stress.")
 
     if (
         fair_conditions["grid_support_discount"]
         and grid_stress
+        and mandatory_reduction_percent > 0
         and achieved_reduction_percent >= mandatory_reduction_percent
     ):
         discount_value = bill * DISCOUNT_RATE
@@ -1536,12 +1665,19 @@ def billing_engine(
         loyalty_discount = bill * LOYALTY_DISCOUNT_RATE
         bill -= loyalty_discount
         discount += loyalty_discount
-        status.append("Loyalty discount applied because usage stayed at or below historical baseline during peak stress.")
+        status.append("Loyalty discount applied because usage stayed at or below the company-approved baseline during peak stress.")
 
     if good_behavior_discount_rate > 0 and grid_stress and final_usage <= baseline:
         good_behavior_discount = bill * good_behavior_discount_rate
         bill -= good_behavior_discount
         status.append(f"Repeated good-behavior discount applied: {good_behavior_discount_rate * 100:.0f}%.")
+
+    if fair_conditions["growth_bonus"] and new_company_growth_mode:
+        company_growth_discount = bill * COMPANY_GROWTH_DISCOUNT_RATE
+        bill -= company_growth_discount
+        discount += company_growth_discount
+        bonus += company_growth_discount
+        status.append("New company growth discount applied to the whole bill after charges and penalties.")
 
     if refused_disconnect and grid_stress and not forced_fair_settlement_active:
         if fair_conditions["customer_autonomy"]:
@@ -1551,7 +1687,7 @@ def billing_engine(
         status.append("Forced fair settlement stabilized the line. Timer and delay penalty are disabled.")
 
     if not status:
-        status.append("Normal billing condition.")
+        status.append("Normal Saudi tariff billing condition.")
 
     final_bill = max(bill, 0)
     amount_saved = max(no_action_bill - final_bill, 0)
@@ -1559,6 +1695,10 @@ def billing_engine(
     return {
         "Normal Usage kWh": normal_usage,
         "Premium Usage kWh": premium_usage,
+        "Saudi Energy Charge SAR": final_tariff["Energy Charge SAR"],
+        "Saudi Meter Fee SAR": final_tariff["Meter Fee SAR"],
+        "Saudi Tier 1 kWh": final_tariff["Tier 1 kWh"],
+        "Saudi Tier 2 kWh": final_tariff["Tier 2 kWh"],
         "Premium Charge": premium_charge,
         "Penalty": penalty,
         "Timer Penalty": timer_penalty,
@@ -1567,12 +1707,12 @@ def billing_engine(
         "Discount": discount,
         "Loyalty Discount": loyalty_discount,
         "Good Behavior Discount": good_behavior_discount,
+        "Company Growth Discount": company_growth_discount,
         "No Action Bill": no_action_bill,
         "Amount Saved": amount_saved,
         "Final Bill": final_bill,
         "Status": " | ".join(status)
     }
-
 
 # =========================================================
 # TIMER ENGINE
@@ -2821,9 +2961,9 @@ fair_conditions = {
 # GRID EVENT CONTROL
 # =========================================================
 
-st.header("Grid Event & Company Control Panel")
+st.header("Live Grid Event Status")
 
-g1, g2, g3, g4 = st.columns(4)
+g1, g2, g3 = st.columns(3)
 
 with g1:
     grid_stress = st.checkbox("Real Stress On Line", value=True)
@@ -2832,10 +2972,9 @@ with g2:
     peak_event = st.checkbox("Peak Usage Event", value=True)
 
 with g3:
-    new_company_growth_mode = st.checkbox("New Company Growth Mode", value=False)
+    new_company_growth_mode = st.checkbox("New Company Growth Mode - cheaper company discount", value=False)
 
-with g4:
-    enforcement_enabled = st.checkbox("Emergency Enforcement Enabled", value=True)
+enforcement_enabled = condition_emergency_enforcement
 
 st.subheader("SCADA Reduction Commands")
 
@@ -2934,6 +3073,27 @@ fraud_guard_df = pd.DataFrame([
 st.subheader("Company Statistical Baseline / Fraud Detection")
 st.info("Company-approved baseline protects the utility from inflated historical baselines by comparing history against house area, occupants, and declared appliance/device mix.")
 st.dataframe(fraud_guard_df, use_container_width=True)
+
+st.divider()
+st.header("Static Compound Monthly Consumption Estimate")
+st.info("Static case study: 8 villas, 3 apartment blocks, and 1 club house. Apartment blocks assume 12 apartments per block. Values are fixed for the compound scenario.")
+compound_summary_df = build_static_compound_summary()
+st.dataframe(compound_summary_df, use_container_width=True)
+compound_total_kwh = float(compound_summary_df.loc[compound_summary_df["Compound Asset"] == "TOTAL COMPOUND", "Total Monthly kWh"].iloc[0])
+compound_total_bill = float(compound_summary_df.loc[compound_summary_df["Compound Asset"] == "TOTAL COMPOUND", "Total Monthly Bill SAR"].iloc[0])
+cm1, cm2 = st.columns(2)
+cm1.metric("Compound Total Monthly Consumption", f"{compound_total_kwh:,.0f} kWh")
+cm2.metric("Compound Total Monthly Bill", f"{compound_total_bill:,.2f} SAR")
+fig_compound = px.bar(
+    compound_summary_df[compound_summary_df["Compound Asset"] != "TOTAL COMPOUND"],
+    x="Compound Asset",
+    y="Total Monthly kWh",
+    color="Category",
+    title="Static Compound Monthly kWh by Asset",
+    text_auto=".0f"
+)
+fig_compound.update_layout(template="plotly_dark", height=520)
+st.plotly_chart(fig_compound, use_container_width=True)
 
 
 # =========================================================
@@ -3390,6 +3550,14 @@ if ignored_request_penalty_active and ignored_request_count > 1:
     billing["Final Bill"] += repeated_ignore_penalty
     billing["Penalty"] += repeated_ignore_penalty
     billing["Status"] += f" | Repeated ignored-request penalty applied after {ignored_request_count} ignored event(s)."
+
+grid_support_discount_applied = bool(
+    fair_conditions["grid_support_discount"]
+    and grid_stress
+    and peak_event
+    and effective_mandatory_reduction_percent > 0
+    and achieved_reduction_percent >= effective_mandatory_reduction_percent
+)
 
 # =========================================================
 # SAVE BEFORE-LAST-RESORT SNAPSHOT
@@ -3877,7 +4045,7 @@ condition_rows.append({
     "Active": fair_conditions["grid_support_discount"],
     "Rule": f"Achieve at least {effective_mandatory_reduction_percent:.2f}% reduction",
     "Result": f"Achieved {achieved_reduction_percent:.2f}%",
-    "Status": "Discount applied" if billing["Discount"] > 0 else "No discount"
+    "Status": "Discount applied" if grid_support_discount_applied else "No discount"
 })
 
 condition_rows.append({
@@ -3930,7 +4098,11 @@ billing_df = pd.DataFrame([{
     "Final Usage kWh": final_usage,
     "Normal Usage kWh": billing["Normal Usage kWh"],
     "Premium Usage kWh": billing["Premium Usage kWh"],
-    "Premium Charge SAR": billing["Premium Charge"],
+    "Saudi Energy Charge SAR": billing.get("Saudi Energy Charge SAR", 0),
+        "Saudi Meter Fee SAR": billing.get("Saudi Meter Fee SAR", 0),
+        "Saudi Tier 1 kWh": billing.get("Saudi Tier 1 kWh", 0),
+        "Saudi Tier 2 kWh": billing.get("Saudi Tier 2 kWh", 0),
+        "Premium Charge SAR": billing["Premium Charge"],
     "Penalty SAR": billing["Penalty"],
     "Timer Penalty SAR": billing["Timer Penalty"],
     "Penalty Waived SAR": billing["Penalty Waived"],
