@@ -12,10 +12,6 @@ from PIL import Image, ImageDraw, ImageFont
 import base64
 import os
 import time
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, Image as RLImage
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
 
 
 # =========================================================
@@ -2082,71 +2078,147 @@ def render_ac_plan_overlay(image_path, ac_states, positions, show_added_labels=F
 
 
 # =========================================================
-# SCADA PDF REPORT GENERATOR
+# SCADA PDF REPORT GENERATOR - PIL ONLY, NO REPORTLAB REQUIRED
 # =========================================================
 def create_scada_pdf_report(report_path="SCADA_FULL_REPORT.pdf"):
-    styles = getSampleStyleSheet()
-    story = []
+    """
+    Generates a PDF using Pillow only.
+    This avoids crashing Streamlit Cloud when reportlab is not installed.
+    """
+    page_w, page_h = 1240, 1754  # A4 at about 150 DPI
+    margin = 70
+    line_gap = 30
+    title_gap = 45
+
+    try:
+        font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 42)
+        font_h = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 30)
+        font_b = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 22)
+        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
+    except Exception:
+        font_title = ImageFont.load_default()
+        font_h = ImageFont.load_default()
+        font_b = ImageFont.load_default()
+        font_small = ImageFont.load_default()
+
+    pages = []
+    img = Image.new("RGB", (page_w, page_h), "white")
+    draw = ImageDraw.Draw(img)
+    y = margin
+
+    def add_page():
+        nonlocal img, draw, y
+        pages.append(img)
+        img = Image.new("RGB", (page_w, page_h), "white")
+        draw = ImageDraw.Draw(img)
+        y = margin
+
+    def wrap_text(text, font, max_width):
+        lines = []
+        for paragraph in str(text).split("\n"):
+            words = paragraph.split()
+            if not words:
+                lines.append("")
+                continue
+            line = words[0]
+            for word in words[1:]:
+                test = line + " " + word
+                try:
+                    bbox = draw.textbbox((0, 0), test, font=font)
+                    width = bbox[2] - bbox[0]
+                except Exception:
+                    width = len(test) * 10
+                if width <= max_width:
+                    line = test
+                else:
+                    lines.append(line)
+                    line = word
+            lines.append(line)
+        return lines
+
+    def ensure_space(required):
+        nonlocal y
+        if y + required > page_h - margin:
+            add_page()
+
+    def add_text(text, font=None, fill="black", gap=line_gap):
+        nonlocal y
+        if font is None:
+            font = font_b
+        max_width = page_w - 2 * margin
+        lines = wrap_text(text, font, max_width)
+        ensure_space(max(60, len(lines) * gap + 20))
+        for line in lines:
+            draw.text((margin, y), line, fill=fill, font=font)
+            y += gap
+        y += 10
 
     def add_title(text):
-        story.append(Paragraph(text, styles["Title"]))
-        story.append(Spacer(1, 12))
+        nonlocal y
+        ensure_space(120)
+        draw.text((margin, y), text, fill="navy", font=font_title)
+        y += 70
+        draw.line((margin, y, page_w - margin, y), fill="navy", width=3)
+        y += 35
 
-    def add_h(text):
-        story.append(Paragraph(text, styles["Heading1"]))
-        story.append(Spacer(1, 8))
-
-    def add_p(text):
-        story.append(Paragraph(text, styles["BodyText"]))
-        story.append(Spacer(1, 7))
+    def add_heading(text):
+        nonlocal y
+        ensure_space(80)
+        draw.text((margin, y), text, fill="darkblue", font=font_h)
+        y += title_gap
 
     def add_table(rows):
-        table = Table(rows, repeatRows=1)
-        table.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,0), colors.darkblue),
-            ("TEXTCOLOR", (0,0), (-1,0), colors.white),
-            ("GRID", (0,0), (-1,-1), 0.5, colors.grey),
-            ("VALIGN", (0,0), (-1,-1), "TOP"),
-            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-            ("FONTSIZE", (0,0), (-1,-1), 8),
-        ]))
-        story.append(table)
-        story.append(Spacer(1, 10))
+        nonlocal y
+        col1 = margin
+        col2 = margin + 390
+        row_h = 48
+        ensure_space(row_h * (len(rows) + 1) + 20)
+        for i, row in enumerate(rows):
+            bg = (220, 235, 255) if i == 0 else (250, 250, 250)
+            draw.rectangle((margin, y, page_w - margin, y + row_h), fill=bg, outline="gray")
+            draw.line((col2 - 15, y, col2 - 15, y + row_h), fill="gray", width=1)
+            f = font_small if i else font_b
+            draw.text((col1 + 10, y + 12), str(row[0])[:42], fill="black", font=f)
+            draw.text((col2, y + 12), str(row[1])[:70], fill="black", font=f)
+            y += row_h
+        y += 20
 
-    # Simple schematic image generated locally for the report.
-    img_path = "scada_report_schematic.png"
-    img = Image.new("RGB", (900, 360), "white")
-    draw = ImageDraw.Draw(img)
-    boxes = [
-        (40, 80, 210, 170, "Smart Meter"),
-        (260, 80, 430, 170, "SCADA Logic"),
-        (480, 80, 650, 170, "Billing / Tariff"),
-        (700, 80, 860, 170, "Grid Stability"),
-        (260, 230, 430, 320, "Solar DER"),
-        (480, 230, 650, 320, "Predictive Maintenance"),
-    ]
-    for x1,y1,x2,y2,label in boxes:
-        draw.rectangle([x1,y1,x2,y2], outline="navy", width=3, fill=(230,240,255))
-        draw.text((x1+18,y1+35), label, fill="black")
-    for x1,y1,x2,y2 in [(210,125,260,125),(430,125,480,125),(650,125,700,125),(345,170,345,230),(565,170,565,230)]:
-        draw.line([x1,y1,x2,y2], fill="black", width=3)
-    img.save(img_path)
-
+    # Cover / index
     add_title("SCADA Dynamic Pricing, Smart Meter, Solar DER and Predictive Maintenance Report")
-    add_h("Index")
-    add_p("1. Abstract<br/>2. Introduction<br/>3. Saudi Tariff and Baseline Model<br/>4. Smart Meter and Fairness Conditions<br/>5. Solar DER and Net Support<br/>6. Crisis Simulation<br/>7. Predictive Maintenance<br/>8. Tables, Graph Choices and Design Explanation<br/>9. Conclusion")
+    add_heading("Index")
+    add_text("1. Abstract\n2. Introduction\n3. Saudi Tariff and Monthly-vs-Daily Baseline Model\n4. Smart Meter and Fairness Conditions\n5. Solar DER and Net Support\n6. Crisis Simulation\n7. Predictive Maintenance\n8. Tables, Graph Choices and Design Explanation\n9. Conclusion")
 
-    add_h("Abstract")
-    add_p("This report documents the SCADA simulation logic, including Saudi residential and commercial monthly tariff rules, daily peak-event baseline conversion, smart meter load shedding, premium versus penalty separation, solar DER support, crisis simulation, and predictive maintenance using P-F curve concepts.")
+    # Simple schematic
+    ensure_space(360)
+    x0, y0 = margin, y
+    boxes = [
+        (x0, y0, x0+230, y0+90, "Smart Meter"),
+        (x0+300, y0, x0+530, y0+90, "SCADA Logic"),
+        (x0+600, y0, x0+830, y0+90, "Billing / Tariff"),
+        (x0+900, y0, x0+1070, y0+90, "Grid Stability"),
+        (x0+300, y0+170, x0+530, y0+260, "Solar DER"),
+        (x0+600, y0+170, x0+900, y0+260, "Predictive Maintenance"),
+    ]
+    for bx1, by1, bx2, by2, label in boxes:
+        draw.rectangle([bx1, by1, bx2, by2], outline="navy", width=3, fill=(230,240,255))
+        draw.text((bx1+18, by1+30), label, fill="black", font=font_small)
+    draw.line((x0+230,y0+45,x0+300,y0+45), fill="black", width=3)
+    draw.line((x0+530,y0+45,x0+600,y0+45), fill="black", width=3)
+    draw.line((x0+830,y0+45,x0+900,y0+45), fill="black", width=3)
+    draw.line((x0+415,y0+90,x0+415,y0+170), fill="black", width=3)
+    draw.line((x0+715,y0+90,x0+715,y0+170), fill="black", width=3)
+    y += 310
 
-    story.append(RLImage(img_path, width=450, height=180))
-    story.append(Spacer(1, 12))
+    add_page()
 
-    add_h("Introduction")
-    add_p("The system models a utility-side SCADA scenario where monthly approved baselines are converted into daily peak-event limits. That prevents unrealistic daily scenarios using full monthly kWh values. The simulator also supports customer autonomy, last-resort fair settlement, medical-device charity support, company growth discounts, and solar self-consumption/export credit.")
+    add_heading("Abstract")
+    add_text("This report documents the SCADA simulation logic, including Saudi residential and commercial monthly tariff rules, daily peak-event baseline conversion, smart meter load shedding, premium versus penalty separation, solar DER support, crisis simulation, and predictive maintenance using P-F curve concepts.")
 
-    add_h("Saudi Tariff and Baseline Model")
-    add_p("Residential billing is monthly: 0.18 SAR/kWh up to 6,000 kWh/month and 0.30 SAR/kWh above 6,000 kWh/month. Commercial billing is monthly: 0.22 SAR/kWh up to 6,000 kWh/month and 0.32 SAR/kWh above 6,000 kWh/month. The SCADA peak event uses daily baseline = monthly approved baseline / 30.")
+    add_heading("Introduction")
+    add_text("The system models a utility-side SCADA scenario where monthly approved baselines are converted into daily peak-event limits. This avoids unrealistic daily scenarios using full monthly kWh values. The simulator supports customer autonomy, last-resort fair settlement, medical-device charity support, company growth discounts, solar self-consumption, and solar export credit.")
+
+    add_heading("Saudi Tariff and Baseline Model")
+    add_text("Residential billing is monthly: 0.18 SAR/kWh up to 6,000 kWh/month and 0.30 SAR/kWh above 6,000 kWh/month. Commercial billing is monthly: 0.22 SAR/kWh up to 6,000 kWh/month and 0.32 SAR/kWh above 6,000 kWh/month. SCADA peak events use daily baseline = monthly approved baseline / 30.")
     add_table([
         ["Item", "Value"],
         ["Residential Tier 1", "0.18 SAR/kWh up to 6,000 kWh/month"],
@@ -2156,27 +2228,28 @@ def create_scada_pdf_report(report_path="SCADA_FULL_REPORT.pdf"):
         ["Daily peak baseline", "Company approved monthly baseline / 30"],
     ])
 
-    add_h("Smart Meter and Fairness Conditions")
-    add_p("The smart meter uses actual appliance quantity, kW per unit, connectivity, preservation limits, and priority order. Lower priority numbers are shed earlier. Protected/critical load is never disconnected unless the table is edited to remove protection.")
-    add_p("Premium and penalty are mutually exclusive. If the customer refuses disconnection and has signed premium preservation, premium pricing can apply. If the customer is above the daily baseline without that premium agreement, the event is treated as penalty behavior instead.")
+    add_heading("Smart Meter and Fairness Conditions")
+    add_text("The smart meter uses appliance quantity, kW per unit, connection status, preservation limits, and priority order. Lower priority numbers are shed earlier. Protected and critical loads remain connected unless the table is manually edited.")
+    add_text("Premium and penalty are mutually exclusive. If the customer refuses disconnection and has signed premium preservation, premium pricing applies. If the customer is above the daily baseline without that premium agreement, the event is treated as penalty behavior instead.")
 
-    add_h("Solar DER and Net Support")
-    add_p("Solar DER reduces billable monthly consumption through self-consumption. If export is enabled during peak stress, surplus generation is credited to the bill. During a daily peak event, solar peak energy can cover the above-baseline amount; if it fully covers that amount, the timer is disabled because the customer is not depending on grid energy above the approved daily baseline.")
+    add_heading("Solar DER and Net Support")
+    add_text("Solar DER reduces billable monthly consumption through self-consumption. If export is enabled during peak stress, surplus generation is credited to the bill. During a daily peak event, solar peak energy can cover above-baseline demand. If solar fully covers the above-baseline amount, the timer is disabled because the customer is not depending on grid energy above the approved daily baseline.")
 
-    add_h("Crisis Simulation")
-    add_p("The crisis model compares required grid support, actual load shed, solar support, maximum controllable shed, and final net grid load. The crisis is stable only when shed kW plus solar support reaches or exceeds the required support target.")
+    add_heading("Crisis Simulation")
+    add_text("The crisis model compares required grid support, actual load shed, solar support, maximum controllable shed, and final net grid load. The crisis is stable only when shed kW plus solar support reaches or exceeds the required support target.")
 
-    add_h("Predictive Maintenance")
-    add_p("The maintenance page tracks grid assets such as transformers, breakers, feeders, switchgear, and distribution panels. It reports condition, predicted remaining useful life, failure risk, P point, F point, and suggested maintenance urgency.")
+    add_heading("Predictive Maintenance")
+    add_text("The maintenance page tracks grid assets such as transformers, breakers, feeders, switchgear, and distribution panels. It reports condition, predicted remaining useful life, failure risk, P point, F point, and suggested maintenance urgency. Component-level indicators identify whether insulation, thermal system, vibration, breaker operations, or fault history need maintenance soon.")
 
-    add_h("Tables, Graph Choices and Design Explanation")
-    add_p("Tables are used for billing transparency, fairness condition evaluation, solar credit accounting, appliance shedding decisions, and compound estimates. Bar charts are used for unit reduction, kW reduction, bill components, compound kWh, and crisis feasibility because these directly compare before/after quantities and required/actual support.")
+    add_heading("Tables, Graph Choices and Design Explanation")
+    add_text("Tables are used for billing transparency, fairness condition evaluation, solar credit accounting, appliance shedding decisions, compound estimates, and maintenance status. Bar charts are used for unit reduction, kW reduction, bill components, compound kWh, and crisis feasibility because these clearly compare before/after quantities and required/actual support.")
 
-    add_h("Conclusion")
-    add_p("The final SCADA design separates monthly tariff/baseline billing from daily peak-event control. This makes scenarios realistic, prevents monthly kWh from being used as daily emergency demand, supports solar DER customers fairly, and makes premium and penalty logic clear and non-overlapping.")
+    add_heading("Conclusion")
+    add_text("The final SCADA design separates monthly tariff/baseline billing from daily peak-event control. This makes scenarios realistic, prevents monthly kWh values from being used as daily emergency demand, supports solar DER customers fairly, and makes premium and penalty logic clear and non-overlapping.")
 
-    doc = SimpleDocTemplate(report_path, pagesize=A4)
-    doc.build(story)
+    if img not in pages:
+        pages.append(img)
+    pages[0].save(report_path, save_all=True, append_images=pages[1:])
     return report_path
 
 # =========================================================
