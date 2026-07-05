@@ -356,6 +356,14 @@ if "person_a_medical_device" not in st.session_state:
     st.session_state.person_a_medical_device = False
 if "person_b_medical_device" not in st.session_state:
     st.session_state.person_b_medical_device = False
+if "ignored_request_count_by_person" not in st.session_state:
+    st.session_state.ignored_request_count_by_person = {}
+if "last_ignored_request_event_id" not in st.session_state:
+    st.session_state.last_ignored_request_event_id = None
+if "override_house_size" not in st.session_state:
+    st.session_state.override_house_size = 120
+if "override_occupants" not in st.session_state:
+    st.session_state.override_occupants = 3
 
 # Stores the latest non-forced scenario so Last Resort can show a simple
 # BEFORE vs AFTER comparison at the end of the page.
@@ -856,14 +864,17 @@ def build_dynamic_maintenance_feature_impact(feature_row, rul_model, risk_model,
 def style_status_cells(status_df):
     def color_status(value):
         value_text = str(value).lower()
-        positive_words = ["satisfied", "within", "applied", "active", "no forced", "no penalty", "discount"]
-        negative_words = ["not satisfied", "above", "penalty active", "access denied", "no discount", "applied" if False else "__never__"]
-        if any(word in value_text for word in ["not satisfied", "above own baseline", "penalty active", "access denied"]):
+        positive_words = ["satisfied", "within", "discount applied", "no forced", "no penalty", "active"]
+        negative_words = ["not satisfied", "above own baseline", "penalty active", "access denied", "no discount"]
+        if any(word in value_text for word in negative_words):
             return "background-color:#7f1d1d;color:white;font-weight:bold;"
         if any(word in value_text for word in positive_words):
             return "background-color:#14532d;color:white;font-weight:bold;"
         return ""
-    return status_df.style.applymap(color_status, subset=["Status"])
+    styler = status_df.style
+    if hasattr(styler, "map"):
+        return styler.map(color_status, subset=["Status"])
+    return styler.applymap(color_status, subset=["Status"])
 
 # =========================================================
 # HYBRID BASELINE CALCULATION
@@ -1790,10 +1801,10 @@ with st.sidebar:
     st.divider()
 
     st.header("Tariff Catalogue")
-    st.write(f"Normal rate: **{BASE_RATE} EGP/kWh**")
-    st.write(f"Peak rate: **{PEAK_RATE} EGP/kWh**")
-    st.write(f"Penalty rate: **{PENALTY_RATE} EGP/kWh**")
-    st.write(f"Premium preservation rate: **{PREMIUM_PRESERVATION_RATE} EGP/kWh**")
+    st.write(f"Normal rate: **{BASE_RATE} SAR/kWh**")
+    st.write(f"Peak rate: **{PEAK_RATE} SAR/kWh**")
+    st.write(f"Penalty rate: **{PENALTY_RATE} SAR/kWh**")
+    st.write(f"Premium preservation rate: **{PREMIUM_PRESERVATION_RATE} SAR/kWh**")
     st.write(f"Grid support discount: **{int(DISCOUNT_RATE * 100)}%**")
     st.write(f"Loyalty baseline discount: **{int(LOYALTY_DISCOUNT_RATE * 100)}%**")
     st.write(f"Growth bonus: **{int(BONUS_RATE * 100)}%**")
@@ -2578,6 +2589,35 @@ if page == "Smart Meter Override Page":
             if st.session_state.climate_mode in climate_options else 0
         )
 
+    ha, hb = st.columns(2)
+    with ha:
+        st.session_state.override_house_size = st.number_input(
+            "Smart Meter House Area Size m²",
+            min_value=1,
+            value=int(st.session_state.override_house_size),
+            step=1,
+            help="Area is used by the company statistical baseline/fraud guard."
+        )
+    with hb:
+        st.session_state.override_occupants = st.number_input(
+            "Smart Meter Occupants",
+            min_value=1,
+            value=int(st.session_state.override_occupants),
+            step=1,
+            help="Occupants are used by the company statistical baseline/fraud guard."
+        )
+
+    override_household_df = pd.DataFrame([{
+        "lamps": int(st.session_state.appliance_config.loc[st.session_state.appliance_config["Appliance"].eq("Lights"), "Quantity"].iloc[0]) if "Lights" in st.session_state.appliance_config["Appliance"].values else 0,
+        "acs": int(st.session_state.appliance_config.loc[st.session_state.appliance_config["Appliance"].eq("ACs"), "Quantity"].iloc[0]) if "ACs" in st.session_state.appliance_config["Appliance"].values else 0,
+        "washing_machine": int(st.session_state.appliance_config.loc[st.session_state.appliance_config["Appliance"].eq("Washing Machine"), "Quantity"].iloc[0]) if "Washing Machine" in st.session_state.appliance_config["Appliance"].values else 0,
+        "heavy_machines": int(st.session_state.appliance_config.loc[st.session_state.appliance_config["Appliance"].eq("Heavy Machines"), "Quantity"].iloc[0]) if "Heavy Machines" in st.session_state.appliance_config["Appliance"].values else 0,
+        "occupants": int(st.session_state.override_occupants),
+        "house_size": int(st.session_state.override_house_size),
+    }])
+    override_expected_baseline = calculate_engineering_baseline(override_household_df)
+    st.metric("Smart Meter Statistical Expected Baseline", f"{override_expected_baseline:.2f} kWh")
+
     st.subheader("Edit Appliance Status and Load Category")
 
     editable_df = ensure_appliance_columns(st.session_state.appliance_config)
@@ -2831,8 +2871,12 @@ with col2:
         default_size=220
     )
 
-baseline_a = predict_historical_baseline(model, person_a)
-baseline_b = predict_historical_baseline(model, person_b)
+historical_baseline_a = predict_historical_baseline(model, person_a)
+historical_baseline_b = predict_historical_baseline(model, person_b)
+company_baseline_a_info = company_statistical_baseline(person_a, historical_baseline_a)
+company_baseline_b_info = company_statistical_baseline(person_b, historical_baseline_b)
+baseline_a = company_baseline_a_info["Company Approved Baseline kWh"]
+baseline_b = company_baseline_b_info["Company Approved Baseline kWh"]
 
 
 # =========================================================
@@ -2840,13 +2884,20 @@ baseline_b = predict_historical_baseline(model, person_b)
 # =========================================================
 
 st.divider()
-st.header("Historical Consumption Baselines")
+st.header("Historical Consumption Baselines + Company Fraud Guard")
 
 m1, m2, m3 = st.columns(3)
-
-m1.metric("Historical Baseline - Person A", f"{baseline_a:.2f} kWh")
-m2.metric("Historical Baseline - Person B", f"{baseline_b:.2f} kWh")
+m1.metric("Company Approved Baseline - Person A", f"{baseline_a:.2f} kWh", delta=f"Historical {historical_baseline_a:.2f}")
+m2.metric("Company Approved Baseline - Person B", f"{baseline_b:.2f} kWh", delta=f"Historical {historical_baseline_b:.2f}")
 m3.metric("Population Mean Baseline", f"{mean_usage:.2f} kWh")
+
+fraud_guard_df = pd.DataFrame([
+    {"Client": "Person A", **company_baseline_a_info},
+    {"Client": "Person B", **company_baseline_b_info},
+])
+st.subheader("Company Statistical Baseline / Fraud Detection")
+st.info("Company-approved baseline protects the utility from inflated historical baselines by comparing history against house area, occupants, and declared appliance/device mix.")
+st.dataframe(fraud_guard_df, use_container_width=True)
 
 
 # =========================================================
@@ -3292,6 +3343,18 @@ if inactive_fairness_count > 0 and grid_stress and peak_event:
     billing["Final Bill"] += fairness_config_adjustment
     billing["Status"] += f" | Fairness configuration adjustment active because {inactive_fairness_count} protection condition(s) are unchecked."
 
+ignored_event_id = f"{selected_person}|ignored={user_failed_to_respond}|stress={stress_active}|requested={round(requested_usage,2)}|baseline={round(selected_baseline,2)}"
+if ignored_request_penalty_active and st.session_state.last_ignored_request_event_id != ignored_event_id:
+    st.session_state.ignored_request_count_by_person[selected_person] = st.session_state.ignored_request_count_by_person.get(selected_person, 0) + 1
+    st.session_state.last_ignored_request_event_id = ignored_event_id
+ignored_request_count = st.session_state.ignored_request_count_by_person.get(selected_person, 0)
+repeated_ignore_penalty = 0.0
+if ignored_request_penalty_active and ignored_request_count > 1:
+    repeated_ignore_penalty = billing["Final Bill"] * min(0.05 * (ignored_request_count - 1), 0.25)
+    billing["Final Bill"] += repeated_ignore_penalty
+    billing["Penalty"] += repeated_ignore_penalty
+    billing["Status"] += f" | Repeated ignored-request penalty applied after {ignored_request_count} ignored event(s)."
+
 # =========================================================
 # SAVE BEFORE-LAST-RESORT SNAPSHOT
 # =========================================================
@@ -3447,6 +3510,17 @@ good_behavior_discount_rate = min(
     GOOD_BEHAVIOR_MAX_DISCOUNT
 )
 
+additional_good_behavior_discount = 0.0
+if good_behavior_discount_rate > 0 and grid_stress and peak_event and final_usage <= selected_baseline:
+    target_good_behavior_discount = billing["Final Bill"] * good_behavior_discount_rate
+    additional_good_behavior_discount = max(target_good_behavior_discount - billing["Good Behavior Discount"], 0)
+    if additional_good_behavior_discount > 0:
+        billing["Final Bill"] = max(billing["Final Bill"] - additional_good_behavior_discount, 0)
+        billing["Good Behavior Discount"] += additional_good_behavior_discount
+        billing["Discount"] += additional_good_behavior_discount
+        billing["Amount Saved"] += additional_good_behavior_discount
+        billing["Status"] += " | Good behavior streak discount applied after tracker update."
+
 # =========================================================
 # MAIN SCADA METRICS
 # =========================================================
@@ -3460,8 +3534,8 @@ s1.metric("Original Connected Load", f"{original_load_kw:.2f} kW")
 s2.metric("Final Connected Load", f"{final_load_kw:.2f} kW")
 s3.metric("Achieved Reduction", f"{achieved_reduction_percent:.2f}%")
 s4.metric("Final Usage", f"{final_usage:.2f} kWh")
-s5.metric("Final Bill", f"{billing['Final Bill']:.2f} EGP")
-s6.metric("Amount Saved", f"{billing['Amount Saved']:.2f} EGP")
+s5.metric("Final Bill", f"{billing['Final Bill']:.2f} SAR")
+s6.metric("Amount Saved", f"{billing['Amount Saved']:.2f} SAR")
 
 e1, e2 = st.columns(2)
 e1.metric("Effective Voluntary Reduction", f"{effective_voluntary_reduction_percent:.2f}%")
@@ -3774,7 +3848,7 @@ condition_rows.append({
     "Condition": "Progressive penalty",
     "Active": fair_conditions["progressive_penalty"],
     "Rule": "Penalty increases according to reduction shortfall",
-    "Result": f"Penalty {billing['Penalty']:.2f} EGP",
+    "Result": f"Penalty {billing['Penalty']:.2f} SAR",
     "Status": "Applied" if billing["Penalty"] > 0 else "No penalty"
 })
 
@@ -3782,7 +3856,7 @@ condition_rows.append({
     "Condition": "Medical device charity support",
     "Active": selected_medical_device,
     "Rule": f"{CHARITY_MEDICAL_DEVICE_DISCOUNT_RATE * 100:.0f}% charity discount for life-support medical device case",
-    "Result": f"Discount {medical_charity_discount:.2f} EGP",
+    "Result": f"Discount {medical_charity_discount:.2f} SAR",
     "Status": "Discount applied" if medical_charity_discount > 0 else "No medical discount"
 })
 
@@ -3792,6 +3866,14 @@ condition_rows.append({
     "Rule": "Immediate delay penalty if user ignored company request during active stress",
     "Result": timer_status,
     "Status": "Penalty active" if ignored_request_penalty_active else "No penalty from ignored request"
+})
+
+condition_rows.append({
+    "Condition": "Company fraud-guard baseline",
+    "Active": True,
+    "Rule": "Historical baseline is capped by statistical expected baseline from house size, occupants, and device mix",
+    "Result": f"Approved baseline {selected_baseline:.2f} kWh instead of historical {(historical_baseline_a if selected_person == 'Person A' else historical_baseline_b):.2f} kWh",
+    "Status": "Satisfied" if selected_baseline <= (historical_baseline_a if selected_person == "Person A" else historical_baseline_b) else "Not satisfied"
 })
 
 condition_df = pd.DataFrame(condition_rows)
@@ -3812,19 +3894,23 @@ billing_df = pd.DataFrame([{
     "Final Usage kWh": final_usage,
     "Normal Usage kWh": billing["Normal Usage kWh"],
     "Premium Usage kWh": billing["Premium Usage kWh"],
-    "Premium Charge EGP": billing["Premium Charge"],
-    "Penalty EGP": billing["Penalty"],
-    "Timer Penalty EGP": billing["Timer Penalty"],
-    "Penalty Waived EGP": billing["Penalty Waived"],
-    "Bonus EGP": billing["Bonus"],
-    "Discount EGP": billing["Discount"],
-    "Loyalty Discount EGP": billing["Loyalty Discount"],
-    "Good Behavior Discount EGP": billing["Good Behavior Discount"],
-    "Medical Charity Discount EGP": medical_charity_discount,
-    "Fairness Config Adjustment EGP": fairness_config_adjustment,
-    "No Action Bill EGP": billing["No Action Bill"],
-    "Amount Saved EGP": billing["Amount Saved"],
-    "Final Bill EGP": billing["Final Bill"],
+    "Premium Charge SAR": billing["Premium Charge"],
+    "Penalty SAR": billing["Penalty"],
+    "Timer Penalty SAR": billing["Timer Penalty"],
+    "Penalty Waived SAR": billing["Penalty Waived"],
+    "Bonus SAR": billing["Bonus"],
+    "Discount SAR": billing["Discount"],
+    "Loyalty Discount SAR": billing["Loyalty Discount"],
+    "Good Behavior Discount SAR": billing["Good Behavior Discount"],
+    "Medical Charity Discount SAR": medical_charity_discount,
+    "Fairness Config Adjustment SAR": fairness_config_adjustment,
+    "Repeated Ignore Penalty SAR": repeated_ignore_penalty,
+    "Ignored Request Count": ignored_request_count,
+    "Historical Baseline Before Fraud Guard kWh": historical_baseline_a if selected_person == "Person A" else historical_baseline_b,
+    "Company Approved Statistical Baseline kWh": selected_baseline,
+    "No Action Bill SAR": billing["No Action Bill"],
+    "Amount Saved SAR": billing["Amount Saved"],
+    "Final Bill SAR": billing["Final Bill"],
     "Condition Status": billing["Status"]
 }])
 
@@ -3934,7 +4020,7 @@ with tab2:
             "Amount Saved",
             "Final Bill"
         ],
-        "EGP": [
+        "SAR": [
             billing["Premium Charge"],
             billing["Penalty"],
             billing["Timer Penalty"],
@@ -3951,7 +4037,7 @@ with tab2:
     fig_bill = px.bar(
         bill_parts,
         x="Component",
-        y="EGP",
+        y="SAR",
         title="Bill Components",
         text_auto=".2f"
     )
