@@ -12,6 +12,10 @@ from PIL import Image, ImageDraw, ImageFont
 import base64
 import os
 import time
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, Image as RLImage
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
 
 
 # =========================================================
@@ -200,6 +204,10 @@ SOLAR_PEAK_AVAILABILITY_FACTOR = 0.85
 SOLAR_OFF_PEAK_AVAILABILITY_FACTOR = 0.45
 SOLAR_DEFAULT_PEAK_SUN_HOURS = 5.5
 SOLAR_EXPORT_CREDIT_RATE = 0.18
+PEAK_EVENT_HOURS = 3.0
+DAYS_PER_BILLING_MONTH = 30.0
+TIMER_AUTO_REFRESH_SECONDS = 5
+
 
 
 PRIORITY_MIN = 1
@@ -410,6 +418,8 @@ if "person_a_solar_export_enabled" not in st.session_state:
     st.session_state.person_a_solar_export_enabled = True
 if "person_b_solar_export_enabled" not in st.session_state:
     st.session_state.person_b_solar_export_enabled = True
+if "premium_preservation_agreement" not in st.session_state:
+    st.session_state.premium_preservation_agreement = True
 
 # Stores the latest non-forced scenario so Last Resort can show a simple
 # BEFORE vs AFTER comparison at the end of the page.
@@ -1716,7 +1726,8 @@ def billing_engine(
     fair_conditions,
     deadline_penalty_active,
     forced_fair_settlement_active,
-    good_behavior_discount_rate
+    good_behavior_discount_rate,
+    premium_agreement_signed=True
 ):
     premium_usage = max(final_usage - baseline, 0)
     normal_usage = min(final_usage, baseline)
@@ -1738,23 +1749,26 @@ def billing_engine(
     company_growth_discount = 0
     status = []
 
-    if grid_stress:
-        if fair_conditions["marginal_premium"]:
-            if premium_usage > 0:
+    if grid_stress and premium_usage > 0:
+        if refused_disconnect and premium_agreement_signed:
+            if fair_conditions["marginal_premium"]:
                 premium_charge = premium_usage * (RESIDENTIAL_TIER2_RATE + 0.10)
-                bill += premium_charge
-                status.append("Premium pricing applied only to usage above the company-approved baseline.")
-        else:
-            if final_usage > baseline:
+                status.append("Premium preservation agreement active: premium pricing applied only to above-baseline usage.")
+            else:
                 premium_charge = final_usage * 0.30
-                bill += premium_charge
-                status.append("General premium pricing applied because marginal baseline protection is disabled.")
+                status.append("Premium preservation agreement active: general premium pricing applied because marginal baseline protection is disabled.")
+            bill += premium_charge
+        else:
+            status.append("Above-baseline usage has no premium preservation agreement, so penalty logic is used instead of premium pricing.")
 
     penalty_should_apply = (
         grid_stress
-        and mandatory_reduction_percent > 0
-        and achieved_reduction_percent < mandatory_reduction_percent
         and not forced_fair_settlement_active
+        and premium_charge <= 0
+        and (
+            (mandatory_reduction_percent > 0 and achieved_reduction_percent < mandatory_reduction_percent)
+            or (premium_usage > 0 and not premium_agreement_signed)
+        )
     )
 
     if (
@@ -1917,40 +1931,27 @@ def deadline_timer_engine(
 
     components.html(
         f"""
-        <div style="
-            padding:14px;
-            border-radius:14px;
-            border:1px solid rgba(255,255,255,0.25);
-            background:rgba(0,0,0,0.45);
-            font-family:Arial;
-            color:white;
-            font-size:20px;">
+        <div style="font-size:22px;color:white;background:#111827;padding:12px;border-radius:10px;">
             <b>Response Deadline Timer:</b>
-            <span id="deadline_timer" style="color:#00ffff;font-weight:bold;"></span>
+            <span id="timer" style="color:#facc15;font-weight:bold;"></span>
         </div>
-
         <script>
-        const endTime = {end_timestamp_ms};
-
+        var endTime = {end_timestamp_ms};
         function updateTimer() {{
-            const now = Date.now();
-            let diff = Math.max(0, endTime - now);
-            let totalSeconds = Math.floor(diff / 1000);
-            let minutes = Math.floor(totalSeconds / 60);
-            let seconds = totalSeconds % 60;
-
-            const text = minutes.toString().padStart(2, '0') + ':' + seconds.toString().padStart(2, '0');
-            document.getElementById("deadline_timer").innerText = text;
-
-            if (diff <= 0) {{
-                document.getElementById("deadline_timer").innerText = "EXPIRED - Penalty/Enforcement Active";
-                document.getElementById("deadline_timer").style.color = "red";
-                setTimeout(() => window.parent.location.reload(), 1500);
+            var now = new Date().getTime();
+            var distance = endTime - now;
+            if (distance <= 0) {{
+                document.getElementById("timer").innerHTML = "EXPIRED - applying penalty";
+                setTimeout(function() {{ window.parent.location.reload(); }}, 700);
+                return;
             }}
+            var minutes = Math.floor((distance % (1000 * 60 * 60)) / (1000 * 60));
+            var seconds = Math.floor((distance % (1000 * 60)) / 1000);
+            document.getElementById("timer").innerHTML = minutes + "m " + seconds + "s";
         }}
-
         updateTimer();
         setInterval(updateTimer, 1000);
+        setTimeout(function() {{ window.parent.location.reload(); }}, {TIMER_AUTO_REFRESH_SECONDS * 1000});
         </script>
         """,
         height=90
@@ -2078,6 +2079,105 @@ def render_ac_plan_overlay(image_path, ac_states, positions, show_added_labels=F
 
     return image
 
+
+
+# =========================================================
+# SCADA PDF REPORT GENERATOR
+# =========================================================
+def create_scada_pdf_report(report_path="SCADA_FULL_REPORT.pdf"):
+    styles = getSampleStyleSheet()
+    story = []
+
+    def add_title(text):
+        story.append(Paragraph(text, styles["Title"]))
+        story.append(Spacer(1, 12))
+
+    def add_h(text):
+        story.append(Paragraph(text, styles["Heading1"]))
+        story.append(Spacer(1, 8))
+
+    def add_p(text):
+        story.append(Paragraph(text, styles["BodyText"]))
+        story.append(Spacer(1, 7))
+
+    def add_table(rows):
+        table = Table(rows, repeatRows=1)
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), colors.darkblue),
+            ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+            ("GRID", (0,0), (-1,-1), 0.5, colors.grey),
+            ("VALIGN", (0,0), (-1,-1), "TOP"),
+            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+            ("FONTSIZE", (0,0), (-1,-1), 8),
+        ]))
+        story.append(table)
+        story.append(Spacer(1, 10))
+
+    # Simple schematic image generated locally for the report.
+    img_path = "scada_report_schematic.png"
+    img = Image.new("RGB", (900, 360), "white")
+    draw = ImageDraw.Draw(img)
+    boxes = [
+        (40, 80, 210, 170, "Smart Meter"),
+        (260, 80, 430, 170, "SCADA Logic"),
+        (480, 80, 650, 170, "Billing / Tariff"),
+        (700, 80, 860, 170, "Grid Stability"),
+        (260, 230, 430, 320, "Solar DER"),
+        (480, 230, 650, 320, "Predictive Maintenance"),
+    ]
+    for x1,y1,x2,y2,label in boxes:
+        draw.rectangle([x1,y1,x2,y2], outline="navy", width=3, fill=(230,240,255))
+        draw.text((x1+18,y1+35), label, fill="black")
+    for x1,y1,x2,y2 in [(210,125,260,125),(430,125,480,125),(650,125,700,125),(345,170,345,230),(565,170,565,230)]:
+        draw.line([x1,y1,x2,y2], fill="black", width=3)
+    img.save(img_path)
+
+    add_title("SCADA Dynamic Pricing, Smart Meter, Solar DER and Predictive Maintenance Report")
+    add_h("Index")
+    add_p("1. Abstract<br/>2. Introduction<br/>3. Saudi Tariff and Baseline Model<br/>4. Smart Meter and Fairness Conditions<br/>5. Solar DER and Net Support<br/>6. Crisis Simulation<br/>7. Predictive Maintenance<br/>8. Tables, Graph Choices and Design Explanation<br/>9. Conclusion")
+
+    add_h("Abstract")
+    add_p("This report documents the SCADA simulation logic, including Saudi residential and commercial monthly tariff rules, daily peak-event baseline conversion, smart meter load shedding, premium versus penalty separation, solar DER support, crisis simulation, and predictive maintenance using P-F curve concepts.")
+
+    story.append(RLImage(img_path, width=450, height=180))
+    story.append(Spacer(1, 12))
+
+    add_h("Introduction")
+    add_p("The system models a utility-side SCADA scenario where monthly approved baselines are converted into daily peak-event limits. That prevents unrealistic daily scenarios using full monthly kWh values. The simulator also supports customer autonomy, last-resort fair settlement, medical-device charity support, company growth discounts, and solar self-consumption/export credit.")
+
+    add_h("Saudi Tariff and Baseline Model")
+    add_p("Residential billing is monthly: 0.18 SAR/kWh up to 6,000 kWh/month and 0.30 SAR/kWh above 6,000 kWh/month. Commercial billing is monthly: 0.22 SAR/kWh up to 6,000 kWh/month and 0.32 SAR/kWh above 6,000 kWh/month. The SCADA peak event uses daily baseline = monthly approved baseline / 30.")
+    add_table([
+        ["Item", "Value"],
+        ["Residential Tier 1", "0.18 SAR/kWh up to 6,000 kWh/month"],
+        ["Residential Tier 2", "0.30 SAR/kWh above 6,000 kWh/month"],
+        ["Commercial Tier 1", "0.22 SAR/kWh up to 6,000 kWh/month"],
+        ["Commercial Tier 2", "0.32 SAR/kWh above 6,000 kWh/month"],
+        ["Daily peak baseline", "Company approved monthly baseline / 30"],
+    ])
+
+    add_h("Smart Meter and Fairness Conditions")
+    add_p("The smart meter uses actual appliance quantity, kW per unit, connectivity, preservation limits, and priority order. Lower priority numbers are shed earlier. Protected/critical load is never disconnected unless the table is edited to remove protection.")
+    add_p("Premium and penalty are mutually exclusive. If the customer refuses disconnection and has signed premium preservation, premium pricing can apply. If the customer is above the daily baseline without that premium agreement, the event is treated as penalty behavior instead.")
+
+    add_h("Solar DER and Net Support")
+    add_p("Solar DER reduces billable monthly consumption through self-consumption. If export is enabled during peak stress, surplus generation is credited to the bill. During a daily peak event, solar peak energy can cover the above-baseline amount; if it fully covers that amount, the timer is disabled because the customer is not depending on grid energy above the approved daily baseline.")
+
+    add_h("Crisis Simulation")
+    add_p("The crisis model compares required grid support, actual load shed, solar support, maximum controllable shed, and final net grid load. The crisis is stable only when shed kW plus solar support reaches or exceeds the required support target.")
+
+    add_h("Predictive Maintenance")
+    add_p("The maintenance page tracks grid assets such as transformers, breakers, feeders, switchgear, and distribution panels. It reports condition, predicted remaining useful life, failure risk, P point, F point, and suggested maintenance urgency.")
+
+    add_h("Tables, Graph Choices and Design Explanation")
+    add_p("Tables are used for billing transparency, fairness condition evaluation, solar credit accounting, appliance shedding decisions, and compound estimates. Bar charts are used for unit reduction, kW reduction, bill components, compound kWh, and crisis feasibility because these directly compare before/after quantities and required/actual support.")
+
+    add_h("Conclusion")
+    add_p("The final SCADA design separates monthly tariff/baseline billing from daily peak-event control. This makes scenarios realistic, prevents monthly kWh from being used as daily emergency demand, supports solar DER customers fairly, and makes premium and penalty logic clear and non-overlapping.")
+
+    doc = SimpleDocTemplate(report_path, pagesize=A4)
+    doc.build(story)
+    return report_path
 
 # =========================================================
 # NAVIGATION
@@ -2327,6 +2427,17 @@ remaining useful life, and graph shape. The feature-impact graph is dynamic for 
             st.info(f"{asset_type}: {asset_state}. {recommendation}")
         else:
             st.success(f"{asset_type}: {asset_state}. {recommendation}")
+
+        st.subheader("Component Maintenance Soon Evaluation")
+        maintenance_soon_rows = [
+            {"Component": "Insulation / Oil System", "Indicator": f"{insulation_health_percent:.1f}%", "Maintenance Need": "Soon" if insulation_health_percent < 65 else "Normal", "Reason": "Low insulation/oil health accelerates failure risk."},
+            {"Component": "Thermal System", "Indicator": f"{temperature_c:.1f} °C", "Maintenance Need": "Soon" if temperature_c > 80 else "Normal", "Reason": "High temperature is a late-stage degradation symptom."},
+            {"Component": "Mechanical / Vibration", "Indicator": f"{vibration_mm_s:.1f} mm/s", "Maintenance Need": "Soon" if vibration_mm_s > 6 else "Normal", "Reason": "Vibration indicates mechanical wear or looseness."},
+            {"Component": "Breaker / Switching Mechanism", "Indicator": f"{breaker_operations}", "Maintenance Need": "Soon" if breaker_operations > 6000 else "Normal", "Reason": "High switching count increases wear on contacts and mechanisms."},
+            {"Component": "Fault History", "Indicator": f"{fault_events_30d} faults / 30 days", "Maintenance Need": "Soon" if fault_events_30d >= 5 else "Normal", "Reason": "Repeated faults indicate unstable condition or protection stress."},
+            {"Component": "Overall Asset", "Indicator": f"RUL {predicted_rul_months:.1f} months", "Maintenance Need": "Soon" if predicted_rul_months <= 12 or risk_probability >= 0.5 else "Normal", "Reason": "Remaining useful life and risk combine all SCADA indicators."},
+        ]
+        st.dataframe(pd.DataFrame(maintenance_soon_rows), use_container_width=True)
 
         st.dataframe(pd.DataFrame([
             {"Point": "td - Degradation Start", "Day": points["td"], "Meaning": "First measurable degradation from normal operation"},
@@ -2597,6 +2708,19 @@ Higher R² and lower MAE usually mean better model performance.
     )
 
     st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+    st.header("Download Full SCADA PDF Report")
+    st.info("Press the button to generate a full graduation-project report with index, abstract, introduction, SCADA logic, tariff logic, solar DER, crisis simulation, predictive maintenance, table/graph explanations, and conclusion.")
+    if st.button("Generate Full SCADA PDF Report"):
+        generated_report_path = create_scada_pdf_report()
+        with open(generated_report_path, "rb") as report_file:
+            st.download_button(
+                label="Download SCADA_FULL_REPORT.pdf",
+                data=report_file,
+                file_name="SCADA_FULL_REPORT.pdf",
+                mime="application/pdf"
+            )
 
     st.stop()
 
@@ -3275,6 +3399,8 @@ company_baseline_a_info = company_statistical_baseline(person_a, historical_base
 company_baseline_b_info = company_statistical_baseline(person_b, historical_baseline_b)
 baseline_a = company_baseline_a_info["Company Approved Baseline kWh"]
 baseline_b = company_baseline_b_info["Company Approved Baseline kWh"]
+baseline_a_daily = baseline_a / DAYS_PER_BILLING_MONTH
+baseline_b_daily = baseline_b / DAYS_PER_BILLING_MONTH
 
 
 # =========================================================
@@ -3285,14 +3411,15 @@ st.divider()
 st.header("Historical Consumption Baselines + Company Fraud Guard")
 
 m1, m2, m3 = st.columns(3)
-m1.metric("Company Approved Baseline - Person A", f"{baseline_a:.2f} kWh", delta=f"Historical {historical_baseline_a:.2f}")
-m2.metric("Company Approved Baseline - Person B", f"{baseline_b:.2f} kWh", delta=f"Historical {historical_baseline_b:.2f}")
-m3.metric("Population Mean Baseline", f"{mean_usage:.2f} kWh")
+m1.metric("Monthly Approved Baseline - Person A", f"{baseline_a:.2f} kWh/month", delta=f"Daily peak limit {baseline_a_daily:.2f} kWh/day")
+m2.metric("Monthly Approved Baseline - Person B", f"{baseline_b:.2f} kWh/month", delta=f"Daily peak limit {baseline_b_daily:.2f} kWh/day")
+m3.metric("Saudi Tariff Tier Limit", f"{SAUDI_TIER_LIMIT_KWH:,.0f} kWh/month")
 
 fraud_guard_df = pd.DataFrame([
     {"Client": "Person A", **company_baseline_a_info},
     {"Client": "Person B", **company_baseline_b_info},
 ])
+fraud_guard_df["Daily Peak Baseline kWh"] = fraud_guard_df["Company Approved Baseline kWh"] / DAYS_PER_BILLING_MONTH
 st.subheader("Company Statistical Baseline / Fraud Detection")
 st.info("Company-approved baseline protects the utility from inflated historical baselines by comparing history against house area, occupants, and declared appliance/device mix.")
 st.dataframe(fraud_guard_df, use_container_width=True)
@@ -3314,17 +3441,17 @@ u1, u2 = st.columns(2)
 
 with u1:
     requested_usage_a = st.number_input(
-        "Person A Requested / Original Usage During Peak Event kWh",
+        "Person A Daily Peak Event Usage kWh",
         min_value=0.0,
-        value=float(baseline_a),
+        value=float(baseline_a_daily),
         step=0.1
     )
 
 with u2:
     requested_usage_b = st.number_input(
-        "Person B Requested / Original Usage During Peak Event kWh",
+        "Person B Daily Peak Event Usage kWh",
         min_value=0.0,
-        value=float(baseline_b + 3),
+        value=float(baseline_b_daily + 3),
         step=0.1
     )
 
@@ -3361,11 +3488,15 @@ with sa2:
     st.session_state.person_b_solar_export_enabled = st.checkbox("Person B export surplus to grid during peak", value=st.session_state.person_b_solar_export_enabled)
 
 if selected_person == "Person A":
-    selected_baseline = baseline_a
+    selected_monthly_baseline = baseline_a
+    selected_daily_baseline = baseline_a_daily
+    selected_baseline = selected_daily_baseline
     requested_usage = requested_usage_a
     selected_household_df = person_a
 else:
-    selected_baseline = baseline_b
+    selected_monthly_baseline = baseline_b
+    selected_daily_baseline = baseline_b_daily
+    selected_baseline = selected_daily_baseline
     requested_usage = requested_usage_b
     selected_household_df = person_b
 
@@ -3426,10 +3557,15 @@ climate_mode = st.session_state.climate_mode
 # One clean stress flag.
 stress_active = grid_stress and peak_event
 
-# Customer baseline relation.
-selected_surplus = max(requested_usage - selected_baseline, 0)
-customer_above_baseline = requested_usage > selected_baseline
-customer_within_or_below_baseline = requested_usage <= selected_baseline
+# Customer baseline relation for DAILY peak event.
+# Monthly approved baseline is converted to daily baseline. Solar peak support reduces grid-dependent peak usage.
+solar_peak_event_support_kwh = 0.0
+if selected_solar_profile["Has Solar"] and stress_active:
+    solar_peak_event_support_kwh = selected_solar_profile["Peak Available Solar kW"] * PEAK_EVENT_HOURS
+net_requested_usage_for_baseline = max(requested_usage - solar_peak_event_support_kwh, 0)
+selected_surplus = max(net_requested_usage_for_baseline - selected_baseline, 0)
+customer_above_baseline = net_requested_usage_for_baseline > selected_baseline
+customer_within_or_below_baseline = net_requested_usage_for_baseline <= selected_baseline
 
 # Last-resort mode means the company emergency settlement button is ON during stress.
 # This must disable the timer completely, even if the selected customer is within baseline.
@@ -3750,18 +3886,22 @@ if forced_fair_settlement_active:
 else:
     final_usage = final_usage_raw
 
-final_usage_before_solar = final_usage
+final_usage_before_solar = final_usage  # daily peak-event usage after shedding before monthly solar accounting
+monthly_projected_usage_before_solar = max(selected_monthly_baseline - selected_daily_baseline + final_usage_before_solar, 0)
+monthly_projected_requested_usage = max(selected_monthly_baseline - selected_daily_baseline + requested_usage, 0)
 solar_monthly_generation_kwh = selected_solar_profile["Monthly Solar Generation kWh"]
 solar_self_consumption_kwh = 0.0
 solar_export_kwh = 0.0
 solar_export_credit_sar = 0.0
+monthly_billing_usage_after_solar = monthly_projected_usage_before_solar
 if selected_solar_profile["Has Solar"]:
     solar_self_consumption_potential = solar_monthly_generation_kwh * selected_solar_profile["Self Use Percent"] / 100
-    solar_self_consumption_kwh = min(final_usage, solar_self_consumption_potential)
-    final_usage = max(final_usage - solar_self_consumption_kwh, 0)
+    solar_self_consumption_kwh = min(monthly_projected_usage_before_solar, solar_self_consumption_potential)
+    monthly_billing_usage_after_solar = max(monthly_projected_usage_before_solar - solar_self_consumption_kwh, 0)
     if selected_solar_profile["Export Enabled"] and stress_active:
         solar_export_kwh = max(solar_monthly_generation_kwh - solar_self_consumption_kwh, 0)
         solar_export_credit_sar = solar_export_kwh * selected_solar_profile["Export Credit Rate SAR/kWh"]
+final_usage = final_usage_before_solar
 
 good_behavior_discount_rate = min(
     st.session_state.good_behavior_streak * GOOD_BEHAVIOR_STEP_DISCOUNT,
@@ -3775,9 +3915,9 @@ if ignored_request_penalty_active:
     timer_status = "User ignored company request. Immediate delay penalty is active for this calculation."
 
 billing = billing_engine(
-    baseline=selected_baseline,
-    requested_usage=requested_usage,
-    final_usage=final_usage,
+    baseline=selected_monthly_baseline,
+    requested_usage=monthly_projected_requested_usage,
+    final_usage=monthly_billing_usage_after_solar,
     mean_usage=mean_usage,
     grid_stress=grid_stress and peak_event,
     new_company_growth_mode=new_company_growth_mode,
@@ -3787,7 +3927,8 @@ billing = billing_engine(
     fair_conditions=fair_conditions,
     deadline_penalty_active=(deadline_penalty_active or ignored_request_penalty_active),
     forced_fair_settlement_active=forced_fair_settlement_active,
-    good_behavior_discount_rate=good_behavior_discount_rate
+    good_behavior_discount_rate=good_behavior_discount_rate,
+    premium_agreement_signed=bool(premium_preservation_agreement and refuse_disconnect)
 )
 if solar_export_credit_sar > 0:
     billing["Final Bill"] = max(billing["Final Bill"] - solar_export_credit_sar, 0)
@@ -3868,8 +4009,8 @@ if not last_resort_mode_active:
 
 stress_active = grid_stress and peak_event
 
-customer_above_baseline = requested_usage > selected_baseline
-customer_within_baseline = requested_usage <= selected_baseline
+customer_above_baseline = net_requested_usage_for_baseline > selected_baseline
+customer_within_baseline = net_requested_usage_for_baseline <= selected_baseline
 
 previous_requested_usage = st.session_state.previous_requested_usage_by_person.get(
     selected_person,
@@ -4010,7 +4151,7 @@ s1, s2, s3, s4, s5, s6 = st.columns(6)
 s1.metric("Original Connected Load", f"{original_load_kw:.2f} kW")
 s2.metric("Final Connected Load", f"{final_load_kw:.2f} kW")
 s3.metric("Achieved Reduction", f"{achieved_reduction_percent:.2f}%")
-s4.metric("Final Usage", f"{final_usage:.2f} kWh")
+s4.metric("Final Daily Peak Usage", f"{final_usage:.2f} kWh/day")
 s5.metric("Final Bill", f"{billing['Final Bill']:.2f} SAR")
 s6.metric("Amount Saved", f"{billing['Amount Saved']:.2f} SAR")
 
@@ -4374,8 +4515,12 @@ st.header("Billing & Condition Results")
 
 billing_df = pd.DataFrame([{
     "Client": selected_person,
-    "Baseline kWh": selected_baseline,
-    "Requested Usage kWh": requested_usage,
+    "Monthly Approved Baseline kWh": selected_monthly_baseline,
+    "Daily Peak Baseline kWh": selected_baseline,
+    "Daily Requested Peak Usage kWh": requested_usage,
+    "Daily Net Grid Usage After Solar kWh": net_requested_usage_for_baseline,
+    "Projected Monthly Requested Usage kWh": monthly_projected_requested_usage,
+    "Projected Monthly Billing Usage After Solar kWh": monthly_billing_usage_after_solar,
     "Final Usage Before Solar kWh": final_usage_before_solar,
     "Solar Self-Consumption kWh": solar_self_consumption_kwh,
     "Solar Export kWh": solar_export_kwh,
