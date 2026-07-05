@@ -202,7 +202,7 @@ SOLAR_DEFAULT_PEAK_SUN_HOURS = 5.5
 SOLAR_EXPORT_CREDIT_RATE = 0.18
 PEAK_EVENT_HOURS = 3.0
 DAYS_PER_BILLING_MONTH = 30.0
-TIMER_AUTO_REFRESH_SECONDS = 5
+# No automatic page refresh is used for the timer.
 
 
 
@@ -1885,8 +1885,9 @@ def deadline_timer_engine(
     """
     Robust Streamlit timer:
     - Stores deadline_end_at in session_state.
-    - If JS reloads the page after expiry, Python still sees that now >= deadline_end_at.
-    - Once expired, penalty is latched until reset or last-resort settlement clears it.
+    - Uses a JavaScript visual countdown without refreshing the page.
+    - Python applies the penalty when the user clicks the check/apply button after expiry,
+      or on the next normal Streamlit rerun.
     """
     now = time.time()
 
@@ -1927,9 +1928,13 @@ def deadline_timer_engine(
 
     components.html(
         f"""
-        <div style="font-size:22px;color:white;background:#111827;padding:12px;border-radius:10px;">
+        <div style="font-size:22px;color:white;background:#111827;padding:12px;border-radius:10px;line-height:1.55;">
             <b>Response Deadline Timer:</b>
             <span id="timer" style="color:#facc15;font-weight:bold;"></span>
+            <br>
+            <span id="timer_note" style="font-size:15px;color:#cbd5e1;">
+                No automatic page refresh is used. When the timer expires, use the SCADA button below to apply the penalty.
+            </span>
         </div>
         <script>
         var endTime = {end_timestamp_ms};
@@ -1937,20 +1942,21 @@ def deadline_timer_engine(
             var now = new Date().getTime();
             var distance = endTime - now;
             if (distance <= 0) {{
-                document.getElementById("timer").innerHTML = "EXPIRED - applying penalty";
-                setTimeout(function() {{ window.parent.location.reload(); }}, 700);
+                document.getElementById("timer").innerHTML = "EXPIRED";
+                document.getElementById("timer").style.color = "#f87171";
+                document.getElementById("timer_note").innerHTML = "Timer finished. Click 'Check timer / apply penalty now' below. No page refresh was triggered.";
                 return;
             }}
+            var hours = Math.floor(distance / (1000 * 60 * 60));
             var minutes = Math.floor((distance % (1000 * 60 * 60)) / (1000 * 60));
             var seconds = Math.floor((distance % (1000 * 60)) / 1000);
-            document.getElementById("timer").innerHTML = minutes + "m " + seconds + "s";
+            document.getElementById("timer").innerHTML = hours + "h " + minutes + "m " + seconds + "s";
         }}
         updateTimer();
         setInterval(updateTimer, 1000);
-        setTimeout(function() {{ window.parent.location.reload(); }}, {TIMER_AUTO_REFRESH_SECONDS * 1000});
         </script>
         """,
-        height=90
+        height=115
     )
 
     return False, f"Timer running. Remaining seconds: {int(remaining)}"
@@ -2219,6 +2225,20 @@ with st.sidebar:
         st.session_state.good_behavior_streak = 0
         st.session_state.last_behavior_event_id = None
         st.rerun()
+
+    st.divider()
+    st.header("SCADA Report")
+    st.caption("The PDF report button is also available on the AI & Model Details page.")
+    if st.button("Generate PDF Report", key="sidebar_generate_pdf_report"):
+        generated_report_path = create_scada_pdf_report()
+        with open(generated_report_path, "rb") as report_file:
+            st.download_button(
+                label="Download SCADA_FULL_REPORT.pdf",
+                data=report_file,
+                file_name="SCADA_FULL_REPORT.pdf",
+                mime="application/pdf",
+                key="sidebar_download_pdf_report"
+            )
 
 
 # =========================================================
@@ -3649,6 +3669,22 @@ else:
 if deadline_penalty_active:
     user_failed_to_respond = True
 
+if timer_should_run and not deadline_penalty_active:
+    remaining_for_button = max(float(st.session_state.get("deadline_end_at", time.time())) - time.time(), 0.0)
+    b_timer_1, b_timer_2 = st.columns([0.35, 0.65])
+    with b_timer_1:
+        if st.button("Check timer / apply penalty now"):
+            if st.session_state.get("deadline_end_at") is not None and time.time() >= st.session_state.deadline_end_at:
+                st.session_state.deadline_penalty_latched = True
+                st.session_state.deadline_penalty_reason = "Timer expired. Penalty/enforcement is active."
+                st.rerun()
+            else:
+                st.warning(f"Timer is still running. Remaining time: {int(remaining_for_button)} seconds.")
+    with b_timer_2:
+        st.caption(
+            "No automatic refresh is used. The countdown can finish on screen without moving your scenario. "
+            "After it shows EXPIRED, press the check/apply button once to latch the timer penalty."
+        )
 
 
 # =========================================================
