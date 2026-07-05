@@ -1502,30 +1502,61 @@ def estimate_saudi_monthly_baseline_from_household(household_df):
 def build_static_compound_summary():
     rows = []
 
+    # User-provided static compound geometry:
+    # - 3 residential apartment buildings
+    # - Each building has ground floor + 6 typical floors = 7 floors
+    # - 4 apartments per floor, therefore 28 apartments per building and 84 apartments total
+    # - Apartment building footprint approximately 500 m² per building
+    # - 8 duplex villas, 3 floors each, footprint approximately 300 m² per villa
+    # - Clubhouse footprint approximately 735 m², 2 floors
     static_assets = [
         {
-            "Compound Asset": "8 Villas",
-            "Meters": 8,
-            "Units per Meter": 1,
+            "Compound Asset": "Residential Apartment Buildings",
+            "Building Count": 3,
+            "Floors per Building": 7,
+            "Ground Floor Apartments": 4,
+            "Typical Floors": 6,
+            "Typical Apartments per Floor": 4,
+            "Total Units": 3 * 28,
+            "Meters": 3 * 28,
             "Category": "Residential",
-            "Monthly kWh per Meter": 3000,
-            "Note": "Standard villa assumption inside Saudi range 2,000-4,000 kWh/month",
-        },
-        {
-            "Compound Asset": "3 Apartment Blocks",
-            "Meters": 36,
-            "Units per Meter": 1,
-            "Category": "Residential",
+            "Footprint per Building m²": 500,
+            "Total Footprint m²": 3 * 500,
+            "Approx Gross Floor Area m²": 3 * 500 * 7,
             "Monthly kWh per Meter": 1200,
-            "Note": "Static assumption: 12 apartments per block, 1,200 kWh/month per apartment",
+            "Note": "3 buildings × 7 floors × 4 apartments/floor = 84 apartments. Static apartment assumption: 1,200 kWh/month per apartment.",
         },
         {
-            "Compound Asset": "Club House",
+            "Compound Asset": "Duplex Villas",
+            "Building Count": 8,
+            "Floors per Building": 3,
+            "Ground Floor Apartments": 0,
+            "Typical Floors": 0,
+            "Typical Apartments per Floor": 0,
+            "Total Units": 8,
+            "Meters": 8,
+            "Category": "Residential",
+            "Footprint per Building m²": 300,
+            "Total Footprint m²": 8 * 300,
+            "Approx Gross Floor Area m²": 8 * 300 * 3,
+            "Monthly kWh per Meter": 3500,
+            "Note": "8 duplex villas × 3 floors. Static villa assumption: 3,500 kWh/month per villa.",
+        },
+        {
+            "Compound Asset": "Clubhouse",
+            "Building Count": 1,
+            "Floors per Building": 2,
+            "Ground Floor Apartments": 0,
+            "Typical Floors": 0,
+            "Typical Apartments per Floor": 0,
+            "Total Units": 1,
             "Meters": 1,
-            "Units per Meter": 1,
             "Category": "Commercial",
-            "Monthly kWh per Meter": 6500,
-            "Note": "Club house treated as commercial with usage crossing 6,000 kWh/month",
+            "Footprint per Building m²": 735,
+            "Total Footprint m²": 735,
+            "Approx Gross Floor Area m²": 735 * 2,
+            "Monthly kWh per Meter": 7500,
+            "Note": "Clubhouse treated as commercial. Static club assumption: 7,500 kWh/month.",
         },
     ]
 
@@ -1548,18 +1579,56 @@ def build_static_compound_summary():
     df = pd.DataFrame(rows)
     total_row = {
         "Compound Asset": "TOTAL COMPOUND",
+        "Building Count": df["Building Count"].sum(),
+        "Floors per Building": "Mixed",
+        "Ground Floor Apartments": df["Ground Floor Apartments"].sum(),
+        "Typical Floors": "Mixed",
+        "Typical Apartments per Floor": "Mixed",
+        "Total Units": df["Total Units"].sum(),
         "Meters": df["Meters"].sum(),
-        "Units per Meter": "",
         "Category": "Mixed",
-        "Monthly kWh per Meter": "",
+        "Footprint per Building m²": "Mixed",
+        "Total Footprint m²": df["Total Footprint m²"].sum(),
+        "Approx Gross Floor Area m²": df["Approx Gross Floor Area m²"].sum(),
+        "Monthly kWh per Meter": "Mixed",
         "Total Monthly kWh": df["Total Monthly kWh"].sum(),
-        "Tier 1 kWh per Meter": "",
-        "Tier 2 kWh per Meter": "",
-        "Monthly Bill per Meter SAR": "",
+        "Tier 1 kWh per Meter": "Mixed",
+        "Tier 2 kWh per Meter": "Mixed",
+        "Monthly Bill per Meter SAR": "Mixed",
         "Total Monthly Bill SAR": df["Total Monthly Bill SAR"].sum(),
-        "Note": "Static compound total",
+        "Note": "Static compound total from user-provided geometry",
     }
     return pd.concat([df, pd.DataFrame([total_row])], ignore_index=True)
+
+
+def build_static_compound_design_table():
+    return pd.DataFrame([
+        {
+            "Asset": "Residential Building",
+            "Quantity": 3,
+            "Floors": "Ground + 6 typical = 7",
+            "Units": "28 apartments/building, 84 apartments total",
+            "Footprint": "≈500 m² per building",
+            "Gross Floor Area": "≈10,500 m² total",
+        },
+        {
+            "Asset": "Duplex Villa",
+            "Quantity": 8,
+            "Floors": "Ground + first + roof = 3",
+            "Units": "8 villas",
+            "Footprint": "≈300 m² per villa",
+            "Gross Floor Area": "≈7,200 m² total",
+        },
+        {
+            "Asset": "Clubhouse",
+            "Quantity": 1,
+            "Floors": "Ground + first = 2",
+            "Units": "1 clubhouse",
+            "Footprint": "≈735 m²",
+            "Gross Floor Area": "≈1,470 m²",
+        },
+    ])
+
 
 # =========================================================
 # BILLING ENGINE
@@ -1952,6 +2021,7 @@ page = st.radio(
         "Smart Meter Override Page",
         "Real Life Simulation",
         "Crisis Live Simulation",
+        "Compound Case Study",
         "Predictive Maintenance",
         "How To Use",
         "AI & Model Details"
@@ -1991,6 +2061,85 @@ with st.sidebar:
         st.session_state.last_behavior_event_id = None
         st.rerun()
 
+
+# =========================================================
+# COMPOUND CASE STUDY PAGE
+# =========================================================
+if page == "Compound Case Study":
+    st.title("Static Compound Case Study")
+    st.markdown("""
+<div class="scada-card">
+<div class="big-status">Static Compound Load & Saudi Tariff Estimate</div>
+This page is separated from the main SCADA control page. It uses the fixed compound geometry provided for the graduation case study.
+</div>
+    """, unsafe_allow_html=True)
+
+    st.subheader("Compound Design Input - Static")
+    design_df = build_static_compound_design_table()
+    st.dataframe(design_df, use_container_width=True)
+
+    st.subheader("Static Monthly Electricity Estimate")
+    compound_summary_df = build_static_compound_summary()
+    st.dataframe(compound_summary_df, use_container_width=True)
+
+    total_row = compound_summary_df[compound_summary_df["Compound Asset"] == "TOTAL COMPOUND"].iloc[0]
+    total_kwh = float(total_row["Total Monthly kWh"])
+    total_bill = float(total_row["Total Monthly Bill SAR"])
+    total_units = int(total_row["Total Units"])
+    total_footprint = float(total_row["Total Footprint m²"])
+    total_gfa = float(total_row["Approx Gross Floor Area m²"])
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Units / Meters", f"{total_units}")
+    c2.metric("Total Monthly kWh", f"{total_kwh:,.0f} kWh")
+    c3.metric("Total Monthly Bill", f"{total_bill:,.2f} SAR")
+    c4.metric("Total Gross Floor Area", f"{total_gfa:,.0f} m²")
+
+    c5, c6 = st.columns(2)
+    c5.metric("Total Footprint", f"{total_footprint:,.0f} m²")
+    c6.metric("Average kWh per Unit/Meter", f"{total_kwh / max(total_units, 1):,.0f} kWh/month")
+
+    chart_df = compound_summary_df[compound_summary_df["Compound Asset"] != "TOTAL COMPOUND"].copy()
+
+    fig_kwh = px.bar(
+        chart_df,
+        x="Compound Asset",
+        y="Total Monthly kWh",
+        color="Category",
+        text_auto=".0f",
+        title="Static Compound Monthly Consumption by Asset"
+    )
+    fig_kwh.update_layout(template="plotly_dark", height=550)
+    st.plotly_chart(fig_kwh, use_container_width=True)
+
+    fig_bill = px.bar(
+        chart_df,
+        x="Compound Asset",
+        y="Total Monthly Bill SAR",
+        color="Category",
+        text_auto=".2f",
+        title="Static Compound Monthly Bill by Asset"
+    )
+    fig_bill.update_layout(template="plotly_dark", height=550)
+    st.plotly_chart(fig_bill, use_container_width=True)
+
+    fig_area = px.bar(
+        chart_df,
+        x="Compound Asset",
+        y="Approx Gross Floor Area m²",
+        text_auto=".0f",
+        title="Approximate Gross Floor Area by Asset"
+    )
+    fig_area.update_layout(template="plotly_dark", height=520)
+    st.plotly_chart(fig_area, use_container_width=True)
+
+    st.subheader("Tariff Notes")
+    st.info(
+        "Residential meters use 0.18 SAR/kWh up to 6,000 kWh/month and 0.30 SAR/kWh above 6,000 kWh/month. "
+        "Commercial meters use 0.22 SAR/kWh up to 6,000 kWh/month and 0.32 SAR/kWh above 6,000 kWh/month. "
+        "The clubhouse is treated as commercial in this static model."
+    )
+    st.stop()
 
 # =========================================================
 # PREDICTIVE MAINTENANCE PAGE
@@ -2166,56 +2315,117 @@ remaining useful life, and graph shape. The feature-impact graph is dynamic for 
 # =========================================================
 
 if page == "How To Use":
-
     st.title("How To Use The Website")
-
     st.markdown("""
 <div class="manual-box">
 
-## Priority Direction
+## 1. SCADA Control Center
 
-The priority number is a load-shedding order.
+Use this page for the main case study demonstration.
 
-- **1** means disconnect first.
-- **2** means disconnect early.
-- **4** means normal shedding.
-- **5** means preserve longer.
-- **Protected / Never Disconnect** means it cannot be disconnected. Protected flag is used instead.
-
-</div>
-
-<div class="manual-box">
-
-## Force Fair Settlement
-
-The last resort settlement button is stronger than user refusal.
-
-If it is ON:
-
-- A user within their own baseline is protected.
-- A user above their own baseline is forced back to the fair baseline limit or below it.
-- The Last Resort comparison shows two modes: Normal Mode result versus Last Resort Mode result.
-- If Last Resort Mode has higher connected kW, it does not mean power was added; it means Normal Mode shed more load than the fair-settlement mode needed.
-- Baseline is measured in kWh, while connected appliance load is measured in kW.
-- Timer is disabled because the system immediately acts.
+- Start with **SCADA Fairness & Protection Conditions**. These are the tariff and protection rules.
+- Use **Live Grid Event Status** to say whether there is real grid stress, peak demand, or cheaper-company growth mode.
+- Use **SCADA Reduction Commands** to set the requested reduction, mandatory reduction, and response deadline.
+- Enter Person A and Person B household data to calculate Saudi monthly statistical baselines.
+- Check the **Company Fraud Guard** table to see whether the historical baseline is realistic for the house size, occupants, and devices.
+- Use **Smart Meter Data Source** to choose whether the simulation follows Person A/B quantities or the exact smart meter table.
+- Review **Billing & Condition Results** to see Saudi tariff charges, penalties, discounts, growth-company discount, medical charity discount, and final bill.
 
 </div>
 
 <div class="manual-box">
 
-## Timer
+## 2. Smart Meter Override Page
 
-The timer runs only when the user refuses or delays during real stress.
+Use this page to edit the actual controllable appliance/load table.
 
-If the timer expires, penalty/enforcement activates.
+- Add or remove appliances using the dynamic table.
+- Change **Quantity**, **Power per Unit kW**, **Connected**, **Load Category**, **User Priority**, and **Company Priority**.
+- Lower priority numbers disconnect earlier.
+- Protected / critical loads are not disconnected.
+- Add **Smart Meter House Area Size m²** and **Occupants** so the company baseline/fraud guard has realistic property context.
+- Any added appliance appears in load charts and crisis simulation if it has quantity, kW, and connected status.
 
-If forced fair settlement is ON, the timer stops because the company already corrected the line stress.
+</div>
+
+<div class="manual-box">
+
+## 3. Real Life Simulation
+
+Use this page for the HVAC apartment-plan style overlay.
+
+- Toggle each AC ON/OFF.
+- The app synchronizes the AC quantity back into the smart meter table.
+- Use this page when you want the visual plan to affect the smart-meter connected load.
+
+</div>
+
+<div class="manual-box">
+
+## 4. Crisis Live Simulation
+
+Use this page to test whether the compound/customer table can survive a crisis target.
+
+- Choose the **Crisis Reduction Target %**.
+- Choose **Company Priority** for emergency company-controlled shedding.
+- Keep **Execute crisis shedding now** ON when you want a real forced crisis action.
+- If **Max Controllable Shed** is lower than **Required Shed**, the crisis is physically impossible with current controllable loads.
+- If emergency execution is OFF, the page shows simulation/policy behavior, not full emergency action.
+- Use the temporary crisis editor to test edge cases without changing the saved smart-meter table.
+
+</div>
+
+<div class="manual-box">
+
+## 5. Compound Case Study
+
+Use this page for the static compound calculation.
+
+- It uses the fixed geometry: 3 apartment buildings, 8 duplex villas, and 1 clubhouse.
+- It calculates total units/meters, total footprint, gross floor area, monthly kWh, and Saudi tariff bill.
+- It is separated from SCADA Control Center so the compound design case does not clutter the live customer simulation.
+
+</div>
+
+<div class="manual-box">
+
+## 6. Predictive Maintenance
+
+Use this page for grid asset health and P-F maintenance curves.
+
+- Select asset type: transformer, feeder cable, breaker, switchgear, or panel.
+- Change age, loading, voltage deviation, temperature, vibration, insulation health, faults, and maintenance quality.
+- Use **Load Perfect Condition Defaults** for a healthy asset case.
+- Read **P** as potential failure and **F** as functional failure.
+- Use the protective maintenance graph to compare no maintenance, predictive maintenance, time-based maintenance, and breakdown maintenance.
+
+</div>
+
+<div class="manual-box">
+
+## 7. AI & Model Details
+
+Use this page to explain the synthetic dataset and ML/baseline logic.
+
+- Shows the synthetic training data preview.
+- Shows model score and baseline distribution.
+- Use this page to explain why the app combines ML, engineering rules, and Saudi tariff logic.
+
+</div>
+
+<div class="manual-box">
+
+## Important Rules
+
+- **Saudi tariff:** residential 1–6,000 kWh/month uses 0.18 SAR/kWh and above 6,000 kWh/month uses 0.30 SAR/kWh.
+- **Company fraud guard:** historical baseline is not trusted alone; the company-approved baseline is checked against property size, occupants, and device mix.
+- **Grid support discount:** applied only if required reduction is actually achieved.
+- **Company growth mode:** applies a cheaper-company discount to the whole bill after penalties and charges when growth mode and growth bonus are enabled.
+- **Last Resort:** company can force fair settlement only during real stress/peak situations; users within approved baseline are protected.
 
 </div>
     """, unsafe_allow_html=True)
-
     st.stop()
-
 
 # =========================================================
 # AI DETAILS PAGE
@@ -2451,63 +2661,40 @@ Pattern: AC6 — AC5 — AC2 / AC3 — AC1 / AC4
 # =========================================================
 
 if page == "Crisis Live Simulation":
-
     st.title("Crisis Live Simulation")
-
     st.markdown("""
 <div class="scada-card">
-<div class="big-status">Live Crisis Simulator</div>
-This page tests whether the system has enough <b>controllable</b> load to satisfy a crisis target.
-It no longer reports stable just because the shedding function ran. It compares:
-<br><br>
-<b>Required Shed kW</b> vs <b>Actual Shed kW</b> vs <b>Maximum Controllable Shed kW</b>.
+<div class="big-status">Live Crisis Simulator - Feasibility First</div>
+This page checks whether the selected appliance table has enough controllable kW to satisfy a crisis target.
+It now separates <b>physical possibility</b>, <b>selected action mode</b>, and <b>actual achieved result</b>.
 </div>
     """, unsafe_allow_html=True)
 
     st.info(
-        "Crisis stability means the actual shed kW reached the requested crisis target. "
-        "If protected loads, preserved minimum service, disconnected appliances, or zero quantities prevent enough shedding, "
-        "the page will show: Crisis target is not fully satisfied."
+        "Crisis stable means actual shed kW reached the required crisis shed kW. "
+        "If controllable loads are protected, disconnected, preserved, or too small, the page will show that the crisis target is not fully satisfied."
     )
 
     c1, c2, c3, c4 = st.columns(4)
-
     with c1:
-        crisis_reduction = st.slider(
-            "Crisis Reduction Target (%)",
-            min_value=0,
-            max_value=90,
-            value=35,
-            step=1
-        )
-
+        crisis_reduction = st.slider("Crisis Reduction Target (%)", min_value=0, max_value=95, value=35, step=1)
     with c2:
-        crisis_policy = st.selectbox(
-            "Crisis Priority Mode",
-            ["Manual User Priority", "Company Priority"],
-            index=1
-        )
-
+        crisis_policy = st.selectbox("Crisis Priority Mode", ["Manual User Priority", "Company Priority"], index=1)
     with c3:
-        force_crisis = st.checkbox("Force crisis shedding now", value=True)
-
+        force_crisis = st.checkbox("Execute crisis shedding now", value=True)
     with c4:
         min_service = st.checkbox("Minimum service preservation", value=True)
 
     st.subheader("Crisis Input Scenario")
-
     crisis_input_mode = st.radio(
         "Choose crisis test input",
         [
             "Use current Smart Meter Override Page table",
             "Built-in impossible crisis test: protected/zero controllable load",
-            "Temporary crisis editor only for this page"
+            "Temporary crisis editor only for this page",
         ],
         index=0,
-        help=(
-            "Use the built-in impossible test if you specifically want to see the warning: "
-            "Crisis target is not fully satisfied. More controllable load is needed."
-        )
+        help="The temporary editor does not overwrite the Smart Meter Override Page table."
     )
 
     base_crisis_config = ensure_appliance_columns(st.session_state.appliance_config.copy())
@@ -2519,15 +2706,9 @@ It no longer reports stable just because the shedding function ran. It compares:
         crisis_input_df.loc[non_protected_mask, "Connected"] = False
         crisis_input_df.loc[non_protected_mask, "Preserve Minimum Units"] = 0
         crisis_input_df = apply_load_category_priority_rules(crisis_input_df)
-        st.warning(
-            "Impossible crisis test is active: non-protected controllable loads are set to zero/disconnected only inside this page. "
-            "This should normally produce the NOT fully satisfied crisis warning."
-        )
-
+        st.warning("Impossible crisis test is active. This should normally fail a non-zero crisis target.")
     elif crisis_input_mode == "Temporary crisis editor only for this page":
-        st.info(
-            "Edit this temporary crisis table to test edge cases. It does not overwrite the Smart Meter Override Page table."
-        )
+        st.info("Edit this temporary table to test crisis edge cases. It does not overwrite the saved smart-meter table.")
         crisis_input_df = st.data_editor(
             base_crisis_config,
             use_container_width=True,
@@ -2548,28 +2729,15 @@ It no longer reports stable just because the shedding function ran. It compares:
             }
         )
         crisis_input_df = apply_load_category_priority_rules(crisis_input_df)
-
     else:
         crisis_input_df = apply_load_category_priority_rules(base_crisis_config)
         st.success("Using the current Smart Meter Override Page appliance table.")
 
-    crisis_df, crisis_original_kw, crisis_final_kw, crisis_achieved, crisis_msg = smart_meter_shed_load(
-        appliance_df=crisis_input_df,
-        requested_reduction_percent=crisis_reduction,
-        policy_mode=crisis_policy,
-        refuse_disconnect=False,
-        climate_mode=st.session_state.climate_mode,
-        mandatory_minimum_percent=crisis_reduction,
-        user_failed_to_respond=True,
-        enforcement_enabled=True,
-        minimum_service_enabled=min_service,
-        force_mode=force_crisis
-    )
-
+    crisis_load_df = calculate_current_connected_load(crisis_input_df)
+    crisis_original_kw = float(crisis_load_df["Connected Load kW"].sum())
     crisis_required_shed_kw = crisis_original_kw * crisis_reduction / 100 if crisis_original_kw > 0 else 0
-    crisis_actual_shed_kw = max(crisis_original_kw - crisis_final_kw, 0)
 
-    # Feasibility estimate: run a 100% forced shedding pass on the same temporary crisis input.
+    # Maximum physical controllability check. This is always forced to 100% to reveal the upper limit.
     max_crisis_df, max_original_kw, max_final_kw, max_achieved, max_msg = smart_meter_shed_load(
         appliance_df=crisis_input_df,
         requested_reduction_percent=100,
@@ -2580,47 +2748,76 @@ It no longer reports stable just because the shedding function ran. It compares:
         user_failed_to_respond=True,
         enforcement_enabled=True,
         minimum_service_enabled=min_service,
-        force_mode=True
+        force_mode=True,
     )
-    crisis_max_controllable_shed_kw = max(max_original_kw - max_final_kw, 0)
+    crisis_max_controllable_shed_kw = float(max_crisis_df["Shed kW"].sum())
 
-    crisis_tolerance_kw = 1e-6
+    if force_crisis:
+        crisis_df, _, crisis_final_kw, crisis_achieved, crisis_msg = smart_meter_shed_load(
+            appliance_df=crisis_input_df,
+            requested_reduction_percent=crisis_reduction,
+            policy_mode=crisis_policy,
+            refuse_disconnect=False,
+            climate_mode=st.session_state.climate_mode,
+            mandatory_minimum_percent=crisis_reduction,
+            user_failed_to_respond=True,
+            enforcement_enabled=True,
+            minimum_service_enabled=min_service,
+            force_mode=True,
+        )
+    else:
+        crisis_df, _, crisis_final_kw, crisis_achieved, crisis_msg = smart_meter_shed_load(
+            appliance_df=crisis_input_df,
+            requested_reduction_percent=crisis_reduction,
+            policy_mode=crisis_policy,
+            refuse_disconnect=False,
+            climate_mode=st.session_state.climate_mode,
+            mandatory_minimum_percent=crisis_reduction,
+            user_failed_to_respond=False,
+            enforcement_enabled=False,
+            minimum_service_enabled=min_service,
+            force_mode=False,
+        )
+        crisis_msg = "Simulation only: Execute crisis shedding now is OFF. Result uses normal policy mode, not emergency forced mode."
 
-    crisis_no_load = crisis_original_kw <= 0
+    crisis_actual_shed_kw = float(crisis_df["Shed kW"].sum())
+    crisis_final_kw = max(crisis_original_kw - crisis_actual_shed_kw, 0)
+    crisis_achieved = (crisis_actual_shed_kw / crisis_original_kw * 100) if crisis_original_kw > 0 else 0
+
+    tolerance_kw = 1e-6
+    crisis_no_load = crisis_original_kw <= tolerance_kw
     crisis_no_target = crisis_reduction <= 0
-    crisis_physically_possible = crisis_max_controllable_shed_kw + crisis_tolerance_kw >= crisis_required_shed_kw
-    crisis_target_met = crisis_actual_shed_kw + crisis_tolerance_kw >= crisis_required_shed_kw
-    crisis_stable = (not crisis_no_load) and (crisis_no_target or (crisis_physically_possible and crisis_target_met))
+    crisis_physically_possible = crisis_max_controllable_shed_kw + tolerance_kw >= crisis_required_shed_kw
+    crisis_target_met = crisis_actual_shed_kw + tolerance_kw >= crisis_required_shed_kw
+    crisis_stable = (not crisis_no_load) and (crisis_no_target or (crisis_physically_possible and crisis_target_met and force_crisis))
 
-    cm1, cm2, cm3, cm4 = st.columns(4)
-    cm1.metric("Original Load", f"{crisis_original_kw:.2f} kW")
-    cm2.metric("Required Shed", f"{crisis_required_shed_kw:.2f} kW")
-    cm3.metric("Actual Shed", f"{crisis_actual_shed_kw:.2f} kW")
-    cm4.metric("Achieved Reduction", f"{crisis_achieved:.2f}%")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Original Load", f"{crisis_original_kw:.2f} kW")
+    m2.metric("Required Shed", f"{crisis_required_shed_kw:.2f} kW")
+    m3.metric("Actual Shed", f"{crisis_actual_shed_kw:.2f} kW")
+    m4.metric("Achieved Reduction", f"{crisis_achieved:.2f}%")
 
-    cm5, cm6, cm7 = st.columns(3)
-    cm5.metric("Final Load", f"{crisis_final_kw:.2f} kW")
-    cm6.metric("Max Controllable Shed", f"{crisis_max_controllable_shed_kw:.2f} kW")
-    cm7.metric("Crisis Target", f"{crisis_reduction:.0f}%")
+    m5, m6, m7, m8 = st.columns(4)
+    m5.metric("Final Load", f"{crisis_final_kw:.2f} kW")
+    m6.metric("Max Controllable Shed", f"{crisis_max_controllable_shed_kw:.2f} kW")
+    m7.metric("Crisis Target", f"{crisis_reduction:.0f}%")
+    m8.metric("Emergency Execution", "ON" if force_crisis else "OFF")
 
     if crisis_no_load:
-        st.error("Crisis target is not fully satisfied. There is no active connected load to control.")
+        st.error("Crisis target is not fully satisfied: there is no active connected load to control.")
     elif crisis_no_target:
         st.info("No crisis reduction target was requested. Set the crisis target above 0% to test stability.")
     elif not crisis_physically_possible:
-        st.warning(
-            "Crisis target is not fully satisfied. More controllable load is needed. "
-            f"Required shed is {crisis_required_shed_kw:.2f} kW, but maximum controllable shed is only {crisis_max_controllable_shed_kw:.2f} kW."
+        st.error(
+            f"Crisis target is physically impossible with current controllable loads. Required shed is {crisis_required_shed_kw:.2f} kW, "
+            f"but maximum controllable shed is only {crisis_max_controllable_shed_kw:.2f} kW."
         )
+    elif not force_crisis:
+        st.warning("Crisis target may be physically possible, but emergency execution is OFF. Turn it ON to run forced crisis shedding.")
     elif not crisis_target_met:
-        st.warning(
-            "Crisis target is not fully satisfied. The system had enough theoretical controllable load, "
-            "but the selected shedding policy did not remove enough load. Check priorities, preservation rules, and force mode."
-        )
+        st.warning("Crisis target is not fully satisfied. Check priorities, preserved minimum units, protected loads, and available controllable kW.")
     else:
-        st.success(
-            "Crisis target satisfied. Grid is stable in this simulation because actual shed kW reached the required crisis shed kW."
-        )
+        st.success("Crisis target satisfied. Grid is stable in this simulation because actual shed kW reached the required crisis shed kW.")
 
     st.info(crisis_msg)
 
@@ -2630,13 +2827,16 @@ It no longer reports stable just because the shedding function ran. It compares:
         crisis_display_df["Remaining Load kW"] = crisis_display_df["Remaining Units"] * crisis_display_df["Power per Unit kW"]
     st.dataframe(crisis_display_df, use_container_width=True)
 
-    st.subheader("Crisis kW Feasibility Summary")
+    st.subheader("Crisis Feasibility Summary")
     crisis_summary_df = pd.DataFrame([
         {"Metric": "Original Load kW", "Value": crisis_original_kw},
         {"Metric": "Required Shed kW", "Value": crisis_required_shed_kw},
         {"Metric": "Actual Shed kW", "Value": crisis_actual_shed_kw},
         {"Metric": "Maximum Controllable Shed kW", "Value": crisis_max_controllable_shed_kw},
         {"Metric": "Final Load kW", "Value": crisis_final_kw},
+        {"Metric": "Physically Possible", "Value": crisis_physically_possible},
+        {"Metric": "Target Met", "Value": crisis_target_met},
+        {"Metric": "Crisis Stable", "Value": crisis_stable},
     ])
     st.dataframe(crisis_summary_df, use_container_width=True)
 
@@ -2644,7 +2844,7 @@ It no longer reports stable just because the shedding function ran. It compares:
     fig_crisis_kw.add_trace(go.Bar(
         x=["Required Shed", "Actual Shed", "Max Controllable Shed"],
         y=[crisis_required_shed_kw, crisis_actual_shed_kw, crisis_max_controllable_shed_kw],
-        marker_color=["orange", "red" if not crisis_target_met else "lime", "deepskyblue"],
+        marker_color=["orange", "lime" if crisis_target_met else "red", "deepskyblue"],
         text=[round(crisis_required_shed_kw, 2), round(crisis_actual_shed_kw, 2), round(crisis_max_controllable_shed_kw, 2)],
         textposition="auto"
     ))
@@ -2654,71 +2854,32 @@ It no longer reports stable just because the shedding function ran. It compares:
         yaxis_title="kW",
         template="plotly_dark",
         height=520,
-        showlegend=False
+        showlegend=False,
     )
     st.plotly_chart(fig_crisis_kw, use_container_width=True)
 
     st.subheader("Unit Reduction Only")
     fig_crisis_units = go.Figure()
-    fig_crisis_units.add_trace(go.Bar(
-        x=crisis_display_df["Appliance"],
-        y=crisis_display_df["Quantity"],
-        name="Before Units",
-        marker_color="deepskyblue",
-        text=crisis_display_df["Quantity"],
-        textposition="auto"
-    ))
-    fig_crisis_units.add_trace(go.Bar(
-        x=crisis_display_df["Appliance"],
-        y=crisis_display_df["Disconnected Units"],
-        name="Disconnected Units",
-        marker_color="red",
-        text=crisis_display_df["Disconnected Units"],
-        textposition="auto"
-    ))
-    fig_crisis_units.add_trace(go.Bar(
-        x=crisis_display_df["Appliance"],
-        y=crisis_display_df["Remaining Units"],
-        name="Remaining Units",
-        marker_color="lime",
-        text=crisis_display_df["Remaining Units"],
-        textposition="auto"
-    ))
-    fig_crisis_units.update_layout(
-        title="Live Crisis Unit Reduction",
-        barmode="group",
-        template="plotly_dark",
-        height=600,
-        yaxis_title="Units"
-    )
+    fig_crisis_units.add_trace(go.Bar(x=crisis_display_df["Appliance"], y=crisis_display_df["Quantity"], name="Before Units", marker_color="deepskyblue", text=crisis_display_df["Quantity"], textposition="auto"))
+    fig_crisis_units.add_trace(go.Bar(x=crisis_display_df["Appliance"], y=crisis_display_df["Disconnected Units"], name="Disconnected Units", marker_color="red", text=crisis_display_df["Disconnected Units"], textposition="auto"))
+    fig_crisis_units.add_trace(go.Bar(x=crisis_display_df["Appliance"], y=crisis_display_df["Remaining Units"], name="Remaining Units", marker_color="lime", text=crisis_display_df["Remaining Units"], textposition="auto"))
+    fig_crisis_units.update_layout(title="Live Crisis Unit Reduction", barmode="group", template="plotly_dark", height=600, yaxis_title="Units")
     st.plotly_chart(fig_crisis_units, use_container_width=True)
 
     st.subheader("Shed kW by Appliance")
-    fig_shed_kw = px.bar(
-        crisis_display_df,
-        x="Appliance",
-        y="Shed kW",
-        title="Crisis Shed kW by Appliance",
-        text_auto=".2f"
-    )
+    fig_shed_kw = px.bar(crisis_display_df, x="Appliance", y="Shed kW", title="Crisis Shed kW by Appliance", text_auto=".2f")
     fig_shed_kw.update_layout(template="plotly_dark", height=520, yaxis_title="Shed kW")
     st.plotly_chart(fig_shed_kw, use_container_width=True)
 
     with st.expander("Why this crisis result happened"):
         st.write("Crisis stable:", crisis_stable)
-        st.write("Original load kW:", round(crisis_original_kw, 4))
-        st.write("Required shed kW:", round(crisis_required_shed_kw, 4))
-        st.write("Actual shed kW:", round(crisis_actual_shed_kw, 4))
-        st.write("Maximum controllable shed kW:", round(crisis_max_controllable_shed_kw, 4))
         st.write("Physically possible:", crisis_physically_possible)
         st.write("Target met:", crisis_target_met)
+        st.write("Emergency execution ON:", force_crisis)
         st.write("Minimum service enabled:", min_service)
-        st.write("Force crisis shedding now:", force_crisis)
         st.write("Crisis input mode:", crisis_input_mode)
-        st.write("Tip: To force the warning, choose the built-in impossible crisis test or edit all non-protected controllable loads to quantity 0 / connected False.")
-
+        st.write("Tip: If max controllable shed is below required shed, add controllable loads, reduce protected loads, lower preserved minimum units, or lower crisis target.")
     st.stop()
-
 
 # =========================================================
 # SMART METER OVERRIDE PAGE
@@ -3073,28 +3234,6 @@ fraud_guard_df = pd.DataFrame([
 st.subheader("Company Statistical Baseline / Fraud Detection")
 st.info("Company-approved baseline protects the utility from inflated historical baselines by comparing history against house area, occupants, and declared appliance/device mix.")
 st.dataframe(fraud_guard_df, use_container_width=True)
-
-st.divider()
-st.header("Static Compound Monthly Consumption Estimate")
-st.info("Static case study: 8 villas, 3 apartment blocks, and 1 club house. Apartment blocks assume 12 apartments per block. Values are fixed for the compound scenario.")
-compound_summary_df = build_static_compound_summary()
-st.dataframe(compound_summary_df, use_container_width=True)
-compound_total_kwh = float(compound_summary_df.loc[compound_summary_df["Compound Asset"] == "TOTAL COMPOUND", "Total Monthly kWh"].iloc[0])
-compound_total_bill = float(compound_summary_df.loc[compound_summary_df["Compound Asset"] == "TOTAL COMPOUND", "Total Monthly Bill SAR"].iloc[0])
-cm1, cm2 = st.columns(2)
-cm1.metric("Compound Total Monthly Consumption", f"{compound_total_kwh:,.0f} kWh")
-cm2.metric("Compound Total Monthly Bill", f"{compound_total_bill:,.2f} SAR")
-fig_compound = px.bar(
-    compound_summary_df[compound_summary_df["Compound Asset"] != "TOTAL COMPOUND"],
-    x="Compound Asset",
-    y="Total Monthly kWh",
-    color="Category",
-    title="Static Compound Monthly kWh by Asset",
-    text_auto=".0f"
-)
-fig_compound.update_layout(template="plotly_dark", height=520)
-st.plotly_chart(fig_compound, use_container_width=True)
-
 
 # =========================================================
 # PERSON SELECTION AND USAGE
