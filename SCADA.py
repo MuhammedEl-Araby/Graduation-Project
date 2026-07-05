@@ -864,8 +864,8 @@ def build_dynamic_maintenance_feature_impact(feature_row, rul_model, risk_model,
 def style_status_cells(status_df):
     def color_status(value):
         value_text = str(value).lower()
-        positive_words = ["satisfied", "within", "discount applied", "no forced", "no penalty", "active"]
         negative_words = ["not satisfied", "above own baseline", "penalty active", "access denied", "no discount"]
+        positive_words = ["satisfied", "within", "discount applied", "no forced", "no penalty", "active"]
         if any(word in value_text for word in negative_words):
             return "background-color:#7f1d1d;color:white;font-weight:bold;"
         if any(word in value_text for word in positive_words):
@@ -925,6 +925,42 @@ def predict_historical_baseline(model, input_df):
 
     return max(final_prediction, 0.5)
 
+
+
+# =========================================================
+# COMPANY STATISTICAL BASELINE / FRAUD-GUARD ENGINE
+# =========================================================
+def company_statistical_baseline(household_df, historical_baseline):
+    row = household_df.iloc[0].astype(float)
+    engineering_baseline = calculate_engineering_baseline(household_df)
+    occupants = max(row["occupants"], 1)
+    size = max(row["house_size"], 1)
+    area_per_person = size / occupants
+    density_adjustment = 1.0
+    if area_per_person < 12:
+        density_adjustment += 0.10
+    elif area_per_person > 80:
+        density_adjustment -= 0.08
+    device_intensity = row["acs"] * 1.15 + row["washing_machine"] * 0.9 + row["heavy_machines"] * 1.55 + row["lamps"] * 0.10
+    reasonable_company_baseline = max(0.5, engineering_baseline * 1.15 * density_adjustment + 0.04 * device_intensity)
+    company_approved_baseline = min(historical_baseline, reasonable_company_baseline)
+    fraud_gap = max(historical_baseline - reasonable_company_baseline, 0)
+    fraud_risk_percent = min((fraud_gap / max(reasonable_company_baseline, 0.1)) * 100, 100)
+    if fraud_risk_percent >= 35:
+        fraud_status = "High baseline inflation risk"
+    elif fraud_risk_percent >= 15:
+        fraud_status = "Medium baseline inflation risk"
+    else:
+        fraud_status = "Normal baseline"
+    return {
+        "Historical Baseline kWh": historical_baseline,
+        "Company Statistical Baseline kWh": reasonable_company_baseline,
+        "Company Approved Baseline kWh": company_approved_baseline,
+        "Fraud Gap kWh": fraud_gap,
+        "Fraud Risk %": fraud_risk_percent,
+        "Fraud Status": fraud_status,
+        "Area per Occupant m²": area_per_person,
+    }
 
 # =========================================================
 # HOUSEHOLD INPUT
@@ -3904,10 +3940,6 @@ billing_df = pd.DataFrame([{
     "Good Behavior Discount SAR": billing["Good Behavior Discount"],
     "Medical Charity Discount SAR": medical_charity_discount,
     "Fairness Config Adjustment SAR": fairness_config_adjustment,
-    "Repeated Ignore Penalty SAR": repeated_ignore_penalty,
-    "Ignored Request Count": ignored_request_count,
-    "Historical Baseline Before Fraud Guard kWh": historical_baseline_a if selected_person == "Person A" else historical_baseline_b,
-    "Company Approved Statistical Baseline kWh": selected_baseline,
     "No Action Bill SAR": billing["No Action Bill"],
     "Amount Saved SAR": billing["Amount Saved"],
     "Final Bill SAR": billing["Final Bill"],
