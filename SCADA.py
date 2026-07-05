@@ -174,6 +174,8 @@ BONUS_RATE = 0.10
 LOYALTY_DISCOUNT_RATE = 0.08
 GOOD_BEHAVIOR_STEP_DISCOUNT = 0.02
 GOOD_BEHAVIOR_MAX_DISCOUNT = 0.12
+CHARITY_MEDICAL_DEVICE_DISCOUNT_RATE = 0.25
+FAIRNESS_INACTIVE_ADJUSTMENT_RATE = 0.01
 PRIORITY_MIN = 1
 PRIORITY_MAX = 10
 
@@ -350,6 +352,10 @@ if "last_good_behavior_counted_event" not in st.session_state:
 
 if "company_force_fair_settlement" not in st.session_state:
     st.session_state.company_force_fair_settlement = False
+if "person_a_medical_device" not in st.session_state:
+    st.session_state.person_a_medical_device = False
+if "person_b_medical_device" not in st.session_state:
+    st.session_state.person_b_medical_device = False
 
 # Stores the latest non-forced scenario so Last Resort can show a simple
 # BEFORE vs AFTER comparison at the end of the page.
@@ -731,11 +737,133 @@ def draw_grid_pf_curve(curve_df, points):
             yv = float(curve_df.loc[curve_df["Day"] == day, "No Maintenance"].iloc[0])
             fig.add_trace(go.Scatter(x=[day], y=[yv], mode="markers+text", name=label, marker=dict(size=22, color=color, line=dict(width=3, color="black")), text=[label], textposition="top center"))
             fig.add_vline(x=day, line_dash="dot", line_color=color)
-    fig.add_hline(y=60, line_dash="dash", line_color="gold", annotation_text="Potential Failure Threshold")
-    fig.add_hline(y=45, line_dash="dash", line_color="red", annotation_text="Functional Failure Threshold")
+    potential_threshold_value = float(curve_df["Potential Failure Threshold"].iloc[0]) if "Potential Failure Threshold" in curve_df.columns else 60.0
+    failure_threshold_value = float(curve_df["Failure Threshold"].iloc[0]) if "Failure Threshold" in curve_df.columns else 45.0
+    fig.add_hline(y=potential_threshold_value, line_dash="dash", line_color="gold", annotation_text="Potential Failure Threshold")
+    fig.add_hline(y=failure_threshold_value, line_dash="dash", line_color="red", annotation_text="Functional Failure Threshold")
     fig.update_layout(title="SCADA P-F Curve: Normal State → Dangerous State → Functional Failure", xaxis_title="Time / Operating Days", yaxis_title="Grid Asset Condition / Performance", template="plotly_dark", height=620, yaxis=dict(range=[0,105]))
     return fig
 
+
+
+# =========================================================
+# MAINTENANCE CASE STUDY HELPERS
+# =========================================================
+def get_grid_asset_profile(asset_type):
+    profiles = {
+        "Distribution Transformer": {
+            "stress_multiplier": 1.15,
+            "condition_offset": -3.0,
+            "rul_multiplier": 0.92,
+            "failure_threshold": 45,
+            "potential_threshold": 62,
+            "default_temperature": 65.0,
+            "default_vibration": 2.4,
+            "default_insulation": 78.0,
+        },
+        "Feeder Cable": {
+            "stress_multiplier": 0.95,
+            "condition_offset": 2.0,
+            "rul_multiplier": 1.08,
+            "failure_threshold": 42,
+            "potential_threshold": 58,
+            "default_temperature": 48.0,
+            "default_vibration": 0.6,
+            "default_insulation": 82.0,
+        },
+        "Circuit Breaker": {
+            "stress_multiplier": 1.35,
+            "condition_offset": -5.0,
+            "rul_multiplier": 0.85,
+            "failure_threshold": 48,
+            "potential_threshold": 65,
+            "default_temperature": 55.0,
+            "default_vibration": 3.8,
+            "default_insulation": 74.0,
+        },
+        "Switchgear": {
+            "stress_multiplier": 1.05,
+            "condition_offset": -1.0,
+            "rul_multiplier": 0.98,
+            "failure_threshold": 45,
+            "potential_threshold": 60,
+            "default_temperature": 58.0,
+            "default_vibration": 2.2,
+            "default_insulation": 80.0,
+        },
+        "Main Distribution Panel": {
+            "stress_multiplier": 1.00,
+            "condition_offset": 0.0,
+            "rul_multiplier": 1.00,
+            "failure_threshold": 45,
+            "potential_threshold": 60,
+            "default_temperature": 50.0,
+            "default_vibration": 1.4,
+            "default_insulation": 84.0,
+        },
+    }
+    return profiles.get(asset_type, profiles["Main Distribution Panel"])
+
+
+def set_perfect_maintenance_defaults():
+    perfect_defaults = {
+        "mx_age_years": 1.0,
+        "mx_loading_percent": 35.0,
+        "mx_peak_stress_percent": 5.0,
+        "mx_voltage_deviation_percent": 0.5,
+        "mx_temperature_c": 32.0,
+        "mx_vibration_mm_s": 0.2,
+        "mx_insulation_health_percent": 100.0,
+        "mx_breaker_operations": 0,
+        "mx_fault_events_30d": 0,
+        "mx_humidity_percent": 35.0,
+        "mx_maintenance_quality": 1.30,
+        "mx_maintenance_day": 365,
+        "mx_restoration_strength": 40.0,
+        "mx_degradation_speed": 0.35,
+        "mx_horizon_days": 730,
+    }
+    for key, value in perfect_defaults.items():
+        st.session_state[key] = value
+
+
+def build_dynamic_maintenance_feature_impact(feature_row, rul_model, risk_model, feature_columns):
+    base_rul = float(rul_model.predict(feature_row[feature_columns])[0])
+    base_risk = float(risk_model.predict_proba(feature_row[feature_columns])[0][1])
+    rows = []
+    for feature in feature_columns:
+        perturbed = feature_row.copy()
+        current_value = float(perturbed[feature].iloc[0])
+        step = max(abs(current_value) * 0.10, 0.5)
+        if feature in ["fault_events_30d"]:
+            step = max(1, round(step))
+        if feature in ["breaker_operations"]:
+            step = max(50, round(step))
+        perturbed[feature] = current_value + step
+        changed_rul = float(rul_model.predict(perturbed[feature_columns])[0])
+        changed_risk = float(risk_model.predict_proba(perturbed[feature_columns])[0][1])
+        rows.append({
+            "SCADA Feature": feature,
+            "Current Value": current_value,
+            "Sensitivity Step": step,
+            "RUL Change Months": changed_rul - base_rul,
+            "Failure Risk Change %": (changed_risk - base_risk) * 100,
+            "Dynamic Impact Score": abs(changed_rul - base_rul) + abs((changed_risk - base_risk) * 100),
+        })
+    return pd.DataFrame(rows).sort_values("Dynamic Impact Score", ascending=False)
+
+
+def style_status_cells(status_df):
+    def color_status(value):
+        value_text = str(value).lower()
+        positive_words = ["satisfied", "within", "applied", "active", "no forced", "no penalty", "discount"]
+        negative_words = ["not satisfied", "above", "penalty active", "access denied", "no discount", "applied" if False else "__never__"]
+        if any(word in value_text for word in ["not satisfied", "above own baseline", "penalty active", "access denied"]):
+            return "background-color:#7f1d1d;color:white;font-weight:bold;"
+        if any(word in value_text for word in positive_words):
+            return "background-color:#14532d;color:white;font-weight:bold;"
+        return ""
+    return status_df.style.applymap(color_status, subset=["Status"])
 
 # =========================================================
 # HYBRID BASELINE CALCULATION
@@ -1685,10 +1813,14 @@ if page == "Predictive Maintenance":
     st.markdown("""
 <div class="scada-card">
 <div class="big-status">SCADA Grid Asset Maintenance Simulator</div>
-This page is linked to the SCADA smart meter table. It predicts asset condition, remaining useful life,
-12-month failure risk, P-F failure points, and protective maintenance benefit.
+This page is linked to the SCADA smart meter table. Asset type now changes stress, condition thresholds,
+remaining useful life, and graph shape. The feature-impact graph is dynamic for the current slider case.
 </div>
     """, unsafe_allow_html=True)
+
+    if st.button("Load Perfect Condition Defaults"):
+        set_perfect_maintenance_defaults()
+        st.success("Perfect-condition maintenance defaults loaded. The next graph uses healthy asset values.")
 
     live_load_df = calculate_current_connected_load(st.session_state.appliance_config)
     live_connected_load_kw = float(live_load_df["Connected Load kW"].sum())
@@ -1696,28 +1828,44 @@ This page is linked to the SCADA smart meter table. It predicts asset condition,
     left_col, right_col = st.columns([0.34, 0.66])
     with left_col:
         st.subheader("SCADA Case Study Inputs")
-        asset_type = st.selectbox("Grid Asset Type", ["Distribution Transformer", "Feeder Cable", "Circuit Breaker", "Switchgear", "Main Distribution Panel"], index=0)
-        use_live_load = st.checkbox("Use current Smart Meter connected load as grid load input", value=True)
+        asset_type = st.selectbox(
+            "Grid Asset Type",
+            ["Distribution Transformer", "Feeder Cable", "Circuit Breaker", "Switchgear", "Main Distribution Panel"],
+            index=0,
+            key="mx_asset_type",
+        )
+        asset_profile = get_grid_asset_profile(asset_type)
+        use_live_load = st.checkbox("Use current Smart Meter connected load as grid load input", value=True, key="mx_use_live_load")
         if use_live_load:
-            live_load_kw = st.number_input("Connected Grid Load kW from SCADA", min_value=0.0, value=float(round(live_connected_load_kw, 2)), step=0.1)
+            live_load_kw = st.number_input(
+                "Connected Grid Load kW from SCADA",
+                min_value=0.0,
+                max_value=None,
+                value=float(round(max(live_connected_load_kw, 0.0), 2)),
+                step=0.1,
+                help="No artificial upper limit. If the SCADA table has high connected kW, this can grow with it.",
+                key="mx_live_load_display",
+            )
         else:
-            live_load_kw = st.number_input("Manual Connected Grid Load kW", min_value=0.0, value=25.0, step=0.5)
-        age_years = st.slider("Asset Age (years)", 0.0, 40.0, 12.0, 0.5)
-        loading_percent = st.slider("Asset Loading (%)", 10.0, 150.0, 82.0, 1.0)
-        peak_stress_percent = st.slider("Peak Stress / Overload Severity (%)", 0.0, 100.0, 45.0, 1.0)
-        voltage_deviation_percent = st.slider("Voltage Deviation (%)", 0.0, 20.0, 4.5, 0.1)
-        temperature_c = st.slider("Asset Temperature (°C)", 20.0, 120.0, 68.0, 1.0)
-        vibration_mm_s = st.slider("Vibration / Mechanical Stress (mm/s)", 0.0, 15.0, 3.2, 0.1)
-        insulation_health_percent = st.slider("Insulation / Oil Health (%)", 0.0, 100.0, 72.0, 1.0)
-        breaker_operations = st.slider("Breaker / Switching Operations", 0, 9000, 1200, 50)
-        fault_events_30d = st.slider("Fault Events in Last 30 Days", 0, 25, 2, 1)
-        humidity_percent = st.slider("Humidity (%)", 10.0, 100.0, 60.0, 1.0)
-        maintenance_quality = st.slider("Maintenance Quality Factor", 0.50, 1.30, 0.95, 0.01)
+            live_load_kw = st.number_input("Manual Connected Grid Load kW", min_value=0.0, max_value=None, value=25.0, step=0.5, key="mx_live_load_manual")
+
+        age_years = st.slider("Asset Age (years)", 0.0, 40.0, st.session_state.get("mx_age_years", 12.0), 0.5, key="mx_age_years")
+        loading_percent = st.slider("Asset Loading (%)", 0.0, 250.0, st.session_state.get("mx_loading_percent", 82.0), 1.0, key="mx_loading_percent")
+        peak_stress_percent = st.slider("Peak Stress / Overload Severity (%)", 0.0, 150.0, st.session_state.get("mx_peak_stress_percent", 45.0), 1.0, key="mx_peak_stress_percent")
+        voltage_deviation_percent = st.slider("Voltage Deviation (%)", 0.0, 40.0, st.session_state.get("mx_voltage_deviation_percent", 4.5), 0.1, key="mx_voltage_deviation_percent")
+        temperature_c = st.slider("Asset Temperature (°C)", 0.0, 180.0, st.session_state.get("mx_temperature_c", asset_profile["default_temperature"]), 1.0, key="mx_temperature_c")
+        vibration_mm_s = st.slider("Vibration / Mechanical Stress (mm/s)", 0.0, 30.0, st.session_state.get("mx_vibration_mm_s", asset_profile["default_vibration"]), 0.1, key="mx_vibration_mm_s")
+        insulation_health_percent = st.slider("Insulation / Oil Health (%)", 0.0, 100.0, st.session_state.get("mx_insulation_health_percent", asset_profile["default_insulation"]), 1.0, key="mx_insulation_health_percent")
+        breaker_operations = st.slider("Breaker / Switching Operations", 0, 30000, st.session_state.get("mx_breaker_operations", 1200), 50, key="mx_breaker_operations")
+        fault_events_30d = st.slider("Fault Events in Last 30 Days", 0, 100, st.session_state.get("mx_fault_events_30d", 2), 1, key="mx_fault_events_30d")
+        humidity_percent = st.slider("Humidity (%)", 0.0, 100.0, st.session_state.get("mx_humidity_percent", 60.0), 1.0, key="mx_humidity_percent")
+        maintenance_quality = st.slider("Maintenance Quality Factor", 0.30, 1.50, st.session_state.get("mx_maintenance_quality", 0.95), 0.01, key="mx_maintenance_quality")
+
         st.subheader("Protective Maintenance Controls")
-        maintenance_day = st.slider("Planned Predictive Maintenance Day", 1, 730, 120, 1)
-        restoration_strength = st.slider("Maintenance Restoration Strength", 0.0, 55.0, 24.0, 1.0)
-        degradation_speed = st.slider("Case Study Degradation Speed", 0.20, 3.00, 1.00, 0.05)
-        horizon_days = st.slider("Simulation Horizon Days", 120, 1095, 730, 30)
+        maintenance_day = st.slider("Planned Predictive Maintenance Day", 1, 1500, st.session_state.get("mx_maintenance_day", 120), 1, key="mx_maintenance_day")
+        restoration_strength = st.slider("Maintenance Restoration Strength", 0.0, 80.0, st.session_state.get("mx_restoration_strength", 24.0), 1.0, key="mx_restoration_strength")
+        degradation_speed = st.slider("Case Study Degradation Speed", 0.05, 5.00, st.session_state.get("mx_degradation_speed", 1.00), 0.05, key="mx_degradation_speed")
+        horizon_days = st.slider("Simulation Horizon Days", 120, 2000, st.session_state.get("mx_horizon_days", 730), 30, key="mx_horizon_days")
 
     feature_row = pd.DataFrame([{
         "age_years": age_years,
@@ -1733,11 +1881,31 @@ This page is linked to the SCADA smart meter table. It predicts asset condition,
         "humidity_percent": humidity_percent,
         "maintenance_quality": maintenance_quality,
     }])
-    predicted_rul_months = float(maintenance_rul_model.predict(feature_row[maintenance_features])[0])
-    risk_probability = float(maintenance_risk_model.predict_proba(feature_row[maintenance_features])[0][1])
-    condition_score, stress_index = calculate_grid_asset_condition(age_years, live_load_kw, loading_percent, peak_stress_percent, voltage_deviation_percent, temperature_c, vibration_mm_s, insulation_health_percent, breaker_operations, fault_events_30d, humidity_percent, maintenance_quality)
+
+    raw_rul_months = float(maintenance_rul_model.predict(feature_row[maintenance_features])[0])
+    raw_risk_probability = float(maintenance_risk_model.predict_proba(feature_row[maintenance_features])[0][1])
+    base_condition_score, base_stress_index = calculate_grid_asset_condition(age_years, live_load_kw, loading_percent, peak_stress_percent, voltage_deviation_percent, temperature_c, vibration_mm_s, insulation_health_percent, breaker_operations, fault_events_30d, humidity_percent, maintenance_quality)
+
+    stress_index = base_stress_index * asset_profile["stress_multiplier"]
+    condition_score = float(np.clip(base_condition_score + asset_profile["condition_offset"] - (asset_profile["stress_multiplier"] - 1.0) * 3.5, 0, 100))
+    predicted_rul_months = float(np.clip(raw_rul_months * asset_profile["rul_multiplier"] - max(asset_profile["stress_multiplier"] - 1.0, 0) * 8, 1, 600))
+    risk_probability = float(np.clip(raw_risk_probability * asset_profile["stress_multiplier"] + max(0, 55 - condition_score) / 160, 0, 1))
+
     asset_state, severity_level, recommendation = classify_grid_maintenance_state(condition_score, risk_probability, predicted_rul_months)
-    curve_df, points = simulate_grid_maintenance_curves(condition_score, stress_index, maintenance_day, restoration_strength, degradation_speed, horizon_days)
+    curve_df, points = simulate_grid_maintenance_curves(condition_score, stress_index, maintenance_day, restoration_strength, degradation_speed * asset_profile["stress_multiplier"], horizon_days)
+    curve_df["Failure Threshold"] = asset_profile["failure_threshold"]
+    curve_df["Potential Failure Threshold"] = asset_profile["potential_threshold"]
+    profile_p_days = curve_df[curve_df["No Maintenance"] <= asset_profile["potential_threshold"]]["Day"]
+    profile_f_days = curve_df[curve_df["No Maintenance"] <= asset_profile["failure_threshold"]]["Day"]
+    profile_d_days = curve_df[curve_df["No Maintenance"] <= 80]["Day"]
+    points = {
+        "td": int(profile_d_days.iloc[0]) if len(profile_d_days) > 0 else None,
+        "p": int(profile_p_days.iloc[0]) if len(profile_p_days) > 0 else None,
+        "f": int(profile_f_days.iloc[0]) if len(profile_f_days) > 0 else None,
+        "breakdown": int(profile_f_days.iloc[0]) if len(profile_f_days) > 0 else None,
+    }
+
+    dynamic_impact_df = build_dynamic_maintenance_feature_impact(feature_row, maintenance_rul_model, maintenance_risk_model, maintenance_features)
 
     with right_col:
         st.subheader("Machine Learning Prediction Result")
@@ -1745,7 +1913,7 @@ This page is linked to the SCADA smart meter table. It predicts asset condition,
         a.metric("Asset Condition", f"{condition_score:.1f}/100")
         b.metric("Predicted RUL", f"{predicted_rul_months:.1f} months")
         c.metric("12-Month Failure Risk", f"{risk_probability * 100:.1f}%")
-        d.metric("Stress Index", f"{stress_index:.2f}")
+        d.metric("Asset-Type Stress Index", f"{stress_index:.2f}")
         if severity_level == "Critical":
             st.error(f"{asset_type}: {asset_state}. {recommendation}")
         elif severity_level == "Danger":
@@ -1754,6 +1922,7 @@ This page is linked to the SCADA smart meter table. It predicts asset condition,
             st.info(f"{asset_type}: {asset_state}. {recommendation}")
         else:
             st.success(f"{asset_type}: {asset_state}. {recommendation}")
+
         st.dataframe(pd.DataFrame([
             {"Point": "td - Degradation Start", "Day": points["td"], "Meaning": "First measurable degradation from normal operation"},
             {"Point": "P - Potential Failure", "Day": points["p"], "Meaning": "Fault symptoms are visible; predictive maintenance should act here"},
@@ -1762,7 +1931,7 @@ This page is linked to the SCADA smart meter table. It predicts asset condition,
         ]), use_container_width=True)
 
     st.divider()
-    st.subheader("P-F Curve: Normal State, Dangerous State, Potential Failure, Functional Failure")
+    st.subheader("P-F Curve: Asset-Type-Aware Normal / Dangerous / Failure States")
     st.plotly_chart(draw_grid_pf_curve(curve_df, points), use_container_width=True)
 
     st.subheader("Protective Maintenance Strategy Graph")
@@ -1773,24 +1942,33 @@ This page is linked to the SCADA smart meter table. It predicts asset condition,
     fig_strategy.add_trace(go.Scatter(x=curve_df["Day"], y=curve_df["Time-Based Maintenance"], mode="lines", name="Time-Based Maintenance", line=dict(color="gray", width=3)))
     fig_strategy.add_trace(go.Scatter(x=curve_df["Day"], y=curve_df["Breakdown Maintenance"], mode="lines", name="Breakdown Maintenance", line=dict(color="firebrick", width=3, dash="dot")))
     fig_strategy.add_trace(go.Scatter(x=curve_df["Day"], y=curve_df["Failure Threshold"], mode="lines", name="Failure Threshold", line=dict(color="red", width=2, dash="dash")))
+    fig_strategy.add_trace(go.Scatter(x=curve_df["Day"], y=curve_df["Potential Failure Threshold"], mode="lines", name="Potential Failure Threshold", line=dict(color="gold", width=2, dash="dash")))
     fig_strategy.add_vline(x=maintenance_day, line_width=3, line_dash="dot", line_color="yellow", annotation_text="Predictive Maintenance Action")
-    fig_strategy.update_layout(title="Protective Maintenance Strategy Comparison", xaxis_title="Time / Operating Days", yaxis_title="Equipment Condition / Performance", template="plotly_dark", height=660, yaxis=dict(range=[0,105]))
+    fig_strategy.update_layout(title=f"Protective Maintenance Strategy Comparison - {asset_type}", xaxis_title="Time / Operating Days", yaxis_title="Equipment Condition / Performance", template="plotly_dark", height=660, yaxis=dict(range=[0,105]))
     st.plotly_chart(fig_strategy, use_container_width=True)
 
     st.subheader("SCADA Maintenance Prediction Dataset Row")
     display_feature_row = feature_row.copy()
+    display_feature_row["Asset Type"] = asset_type
     display_feature_row["Predicted RUL Months"] = predicted_rul_months
     display_feature_row["Failure Risk Probability"] = risk_probability
     display_feature_row["Condition Score"] = condition_score
-    display_feature_row["Stress Index"] = stress_index
+    display_feature_row["Asset-Type Stress Index"] = stress_index
     display_feature_row["Asset State"] = asset_state
     st.dataframe(display_feature_row, use_container_width=True)
 
-    st.subheader("ML Feature Importance for Remaining Useful Life")
-    feature_importance_df = pd.DataFrame({"SCADA Feature": maintenance_features, "Importance": maintenance_rul_model.feature_importances_}).sort_values("Importance", ascending=False)
-    fig_importance = px.bar(feature_importance_df, x="SCADA Feature", y="Importance", title="SCADA Signals Influencing Predicted Remaining Useful Life", text_auto=".3f")
-    fig_importance.update_layout(template="plotly_dark", height=520)
-    st.plotly_chart(fig_importance, use_container_width=True)
+    st.subheader("Dynamic ML Feature Impact for This Current Case")
+    st.info("This graph changes with the sliders. It is not the static Random Forest global feature importance.")
+    fig_dynamic = px.bar(dynamic_impact_df, x="SCADA Feature", y="Dynamic Impact Score", title="Current Case Sensitivity: Which slider changes the prediction most?", text_auto=".2f")
+    fig_dynamic.update_layout(template="plotly_dark", height=520)
+    st.plotly_chart(fig_dynamic, use_container_width=True)
+    st.dataframe(dynamic_impact_df, use_container_width=True)
+
+    with st.expander("Show static model feature importance"):
+        feature_importance_df = pd.DataFrame({"SCADA Feature": maintenance_features, "Importance": maintenance_rul_model.feature_importances_}).sort_values("Importance", ascending=False)
+        fig_importance = px.bar(feature_importance_df, x="SCADA Feature", y="Importance", title="Static Model Feature Importance", text_auto=".3f")
+        fig_importance.update_layout(template="plotly_dark", height=520)
+        st.plotly_chart(fig_importance, use_container_width=True)
 
     st.subheader("Maintenance Curve Data")
     st.dataframe(curve_df, use_container_width=True)
@@ -2539,6 +2717,13 @@ with fc3:
     condition_loyalty_discount = st.checkbox("Loyalty discount below baseline", value=True)
     condition_progressive_penalty = st.checkbox("Progressive penalty by shortfall", value=True)
     condition_growth_bonus = st.checkbox("Company growth bonus when grid is stable", value=False)
+    st.checkbox(
+        "Company force fair settlement for all users causing line stress",
+        value=company_force_fair_settlement,
+        key="company_force_fair_settlement",
+        help="13th protection button: company last-resort control during real stress."
+    )
+    company_force_fair_settlement = st.session_state.get("company_force_fair_settlement", False)
 
 fair_conditions = {
     "district_reduction": condition_district_reduction,
@@ -2693,6 +2878,20 @@ with u2:
         min_value=0.0,
         value=float(baseline_b + 3),
         step=0.1
+    )
+
+mda, mdb = st.columns(2)
+with mda:
+    st.session_state.person_a_medical_device = st.checkbox(
+        "Person A has life-support medical device - charity discount",
+        value=st.session_state.person_a_medical_device,
+        help="Applies a charity discount and flags the customer as medically protected for billing review."
+    )
+with mdb:
+    st.session_state.person_b_medical_device = st.checkbox(
+        "Person B has life-support medical device - charity discount",
+        value=st.session_state.person_b_medical_device,
+        help="Applies a charity discount and flags the customer as medically protected for billing review."
     )
 
 if selected_person == "Person A":
@@ -3054,6 +3253,12 @@ good_behavior_discount_rate = min(
     GOOD_BEHAVIOR_MAX_DISCOUNT
 )
 
+ignored_request_penalty_active = bool(
+    user_failed_to_respond and stress_active and not last_resort_mode_active
+)
+if ignored_request_penalty_active:
+    timer_status = "User ignored company request. Immediate delay penalty is active for this calculation."
+
 billing = billing_engine(
     baseline=selected_baseline,
     requested_usage=requested_usage,
@@ -3065,10 +3270,27 @@ billing = billing_engine(
     achieved_reduction_percent=achieved_reduction_percent,
     mandatory_reduction_percent=effective_mandatory_reduction_percent,
     fair_conditions=fair_conditions,
-    deadline_penalty_active=deadline_penalty_active,
+    deadline_penalty_active=(deadline_penalty_active or ignored_request_penalty_active),
     forced_fair_settlement_active=forced_fair_settlement_active,
     good_behavior_discount_rate=good_behavior_discount_rate
 )
+
+selected_medical_device = (
+    st.session_state.person_a_medical_device if selected_person == "Person A" else st.session_state.person_b_medical_device
+)
+medical_charity_discount = 0.0
+if selected_medical_device:
+    medical_charity_discount = billing["Final Bill"] * CHARITY_MEDICAL_DEVICE_DISCOUNT_RATE
+    billing["Final Bill"] = max(billing["Final Bill"] - medical_charity_discount, 0)
+    billing["Amount Saved"] += medical_charity_discount
+    billing["Status"] += " | Medical life-support charity discount applied."
+
+inactive_fairness_count = sum(1 for key, value in fair_conditions.items() if key != "growth_bonus" and not value)
+fairness_config_adjustment = 0.0
+if inactive_fairness_count > 0 and grid_stress and peak_event:
+    fairness_config_adjustment = billing["Final Bill"] * FAIRNESS_INACTIVE_ADJUSTMENT_RATE * inactive_fairness_count
+    billing["Final Bill"] += fairness_config_adjustment
+    billing["Status"] += f" | Fairness configuration adjustment active because {inactive_fairness_count} protection condition(s) are unchecked."
 
 # =========================================================
 # SAVE BEFORE-LAST-RESORT SNAPSHOT
@@ -3254,15 +3476,15 @@ e3.metric("Forced Fair Settlement", "Active" if forced_fair_settlement_active el
 
 if last_resort_mode_active:
     visible_timer_state = "Disabled by Last Resort"
-elif deadline_penalty_active:
-    visible_timer_state = "Expired"
+elif deadline_penalty_active or ignored_request_penalty_active:
+    visible_timer_state = "Expired / Ignored"
 elif timer_should_run:
     visible_timer_state = "Running"
 else:
     visible_timer_state = "Inactive"
 
 e4.metric("Timer Status", visible_timer_state)
-e5.metric("Timer Penalty", "Active" if deadline_penalty_active else "Inactive")
+e5.metric("Timer Penalty", "Active" if (deadline_penalty_active or ignored_request_penalty_active) else "Inactive")
 
 if st.session_state.get("deadline_penalty_latched", False):
     st.error("Deadline expired. Timer penalty/enforcement is latched active.")
@@ -3290,8 +3512,8 @@ elif customer_within_or_below_baseline and stress_active:
 elif timer_should_run and not deadline_penalty_active:
     st.warning("Timer is running because the selected customer is above baseline during stress.")
 
-if deadline_penalty_active:
-    st.error("Deadline expired. Penalty/enforcement is now active.")
+if deadline_penalty_active or ignored_request_penalty_active:
+    st.error("Deadline expired or company request ignored. Penalty/enforcement is now active.")
 
 st.info(enforcement_status)
 
@@ -3369,7 +3591,7 @@ fig_units.update_layout(
 st.plotly_chart(fig_units, use_container_width=True)
 
 st.subheader("Power Reduction Only")
-kw_view = qty_view[qty_view["Connected Load kW"] > 0].copy()
+kw_view = qty_view.copy()
 fig_kw = go.Figure()
 fig_kw.add_trace(go.Bar(
     x=kw_view["Appliance"],
@@ -3461,7 +3683,7 @@ if company_force_fair_settlement and grid_stress and peak_event:
         )
 
         for _, load_row in client_shed_df.iterrows():
-            if load_row["Disconnected Units"] > 0 or load_row["Appliance"] in ["Lights", "Washing Machine", "Heavy Machines", "ACs"]:
+            if load_row["Disconnected Units"] > 0 or load_row["Quantity"] > 0 or load_row["Connected Load kW"] > 0:
                 both_results.append({
                     "Client": client_name,
                     "Appliance": load_row["Appliance"],
@@ -3556,8 +3778,24 @@ condition_rows.append({
     "Status": "Applied" if billing["Penalty"] > 0 else "No penalty"
 })
 
+condition_rows.append({
+    "Condition": "Medical device charity support",
+    "Active": selected_medical_device,
+    "Rule": f"{CHARITY_MEDICAL_DEVICE_DISCOUNT_RATE * 100:.0f}% charity discount for life-support medical device case",
+    "Result": f"Discount {medical_charity_discount:.2f} EGP",
+    "Status": "Discount applied" if medical_charity_discount > 0 else "No medical discount"
+})
+
+condition_rows.append({
+    "Condition": "Ignored company request",
+    "Active": ignored_request_penalty_active,
+    "Rule": "Immediate delay penalty if user ignored company request during active stress",
+    "Result": timer_status,
+    "Status": "Penalty active" if ignored_request_penalty_active else "No penalty from ignored request"
+})
+
 condition_df = pd.DataFrame(condition_rows)
-st.dataframe(condition_df, use_container_width=True)
+st.dataframe(style_status_cells(condition_df), use_container_width=True)
 
 
 # =========================================================
@@ -3582,6 +3820,8 @@ billing_df = pd.DataFrame([{
     "Discount EGP": billing["Discount"],
     "Loyalty Discount EGP": billing["Loyalty Discount"],
     "Good Behavior Discount EGP": billing["Good Behavior Discount"],
+    "Medical Charity Discount EGP": medical_charity_discount,
+    "Fairness Config Adjustment EGP": fairness_config_adjustment,
     "No Action Bill EGP": billing["No Action Bill"],
     "Amount Saved EGP": billing["Amount Saved"],
     "Final Bill EGP": billing["Final Bill"],
@@ -3610,7 +3850,7 @@ with tab1:
     if "Remaining Load kW" not in load_view.columns:
         load_view["Remaining Load kW"] = load_view["Remaining Units"] * load_view["Power per Unit kW"]
 
-    load_view = load_view[load_view["Connected Load kW"] > 0].copy()
+    load_view = load_view.copy()
     load_view = load_view.sort_values(
         by=["Emergency Shed Rank", "Shed kW", "Appliance"] if "Emergency Shed Rank" in load_view.columns else ["Shed kW", "Appliance"],
         ascending=[True, False, True] if "Emergency Shed Rank" in load_view.columns else [False, True]
@@ -3861,16 +4101,7 @@ st.warning(
     "Users within their own baseline are protected. Users above baseline are denied access above the fair limit."
 )
 
-st.checkbox(
-    "Company force fair settlement for all users causing line stress",
-    value=company_force_fair_settlement,
-    key="company_force_fair_settlement",
-    help=(
-        "If enabled, users who stay within their own baseline are not disconnected. "
-        "Users who exceed their fair baseline during real stress are forced to reduce immediately, "
-        "even if premium payment or refusal is selected."
-    )
-)
+st.info("The Last Resort company fair-settlement button is now included as the 13th checkbox under SCADA Fairness & Protection Conditions.")
 
 if company_force_fair_settlement:
     st.error(
@@ -4104,9 +4335,9 @@ if forced_fair_settlement_active:
         "The customer exceeded their own historical baseline during real line stress. "
         "Company forced reduction was applied using company priority, overriding refusal and premium payment."
     )
-elif deadline_penalty_active:
+elif deadline_penalty_active or ignored_request_penalty_active:
     st.error(
-        "Final Decision: The response deadline expired. Penalty/enforcement is active because the user delayed or refused while stress remained."
+        "Final Decision: The response deadline expired or the user ignored the company request. Penalty/enforcement is active while stress remains."
     )
 elif grid_stress and peak_event and achieved_reduction_percent < effective_mandatory_reduction_percent:
     st.error(
