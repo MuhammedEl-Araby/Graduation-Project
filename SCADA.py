@@ -2081,174 +2081,91 @@ def render_ac_plan_overlay(image_path, ac_states, positions, show_added_labels=F
 # SCADA PDF REPORT GENERATOR - PIL ONLY, NO REPORTLAB REQUIRED
 # =========================================================
 def create_scada_pdf_report(report_path="SCADA_FULL_REPORT.pdf"):
-    """
-    Generates a PDF using Pillow only.
-    This avoids crashing Streamlit Cloud when reportlab is not installed.
-    """
-    page_w, page_h = 1240, 1754  # A4 at about 150 DPI
+    """Generate a simple PDF using Pillow only so Streamlit Cloud does not need reportlab."""
+    page_w, page_h = 1240, 1754
     margin = 70
-    line_gap = 30
-    title_gap = 45
-
-    try:
-        font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 42)
-        font_h = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 30)
-        font_b = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 22)
-        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
-    except Exception:
-        font_title = ImageFont.load_default()
-        font_h = ImageFont.load_default()
-        font_b = ImageFont.load_default()
-        font_small = ImageFont.load_default()
-
     pages = []
     img = Image.new("RGB", (page_w, page_h), "white")
     draw = ImageDraw.Draw(img)
     y = margin
-
-    def add_page():
+    try:
+        font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 40)
+        font_h = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
+        font_b = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 21)
+        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
+    except Exception:
+        font_title = ImageFont.load_default(); font_h = ImageFont.load_default(); font_b = ImageFont.load_default(); font_small = ImageFont.load_default()
+    def new_page():
         nonlocal img, draw, y
         pages.append(img)
         img = Image.new("RGB", (page_w, page_h), "white")
         draw = ImageDraw.Draw(img)
         y = margin
-
-    def wrap_text(text, font, max_width):
-        lines = []
-        for paragraph in str(text).split("\n"):
-            words = paragraph.split()
+    def wrap(text, font, width):
+        out=[]
+        for para in str(text).split("\n"):
+            words=para.split()
             if not words:
-                lines.append("")
-                continue
-            line = words[0]
-            for word in words[1:]:
-                test = line + " " + word
-                try:
-                    bbox = draw.textbbox((0, 0), test, font=font)
-                    width = bbox[2] - bbox[0]
-                except Exception:
-                    width = len(test) * 10
-                if width <= max_width:
-                    line = test
-                else:
-                    lines.append(line)
-                    line = word
-            lines.append(line)
-        return lines
-
-    def ensure_space(required):
+                out.append(""); continue
+            line=words[0]
+            for w in words[1:]:
+                test=line+" "+w
+                try: tw=draw.textbbox((0,0), test, font=font)[2]
+                except Exception: tw=len(test)*10
+                if tw <= width: line=test
+                else: out.append(line); line=w
+            out.append(line)
+        return out
+    def ensure(lines=4):
         nonlocal y
-        if y + required > page_h - margin:
-            add_page()
-
-    def add_text(text, font=None, fill="black", gap=line_gap):
+        if y + lines*32 + 80 > page_h - margin:
+            new_page()
+    def text(t, font=None, color="black", gap=30):
         nonlocal y
-        if font is None:
-            font = font_b
-        max_width = page_w - 2 * margin
-        lines = wrap_text(text, font, max_width)
-        ensure_space(max(60, len(lines) * gap + 20))
+        font = font or font_b
+        lines=wrap(t, font, page_w-2*margin)
+        ensure(len(lines))
         for line in lines:
-            draw.text((margin, y), line, fill=fill, font=font)
-            y += gap
-        y += 10
-
-    def add_title(text):
+            draw.text((margin,y), line, fill=color, font=font); y += gap
+        y += 12
+    def title(t):
         nonlocal y
-        ensure_space(120)
-        draw.text((margin, y), text, fill="navy", font=font_title)
-        y += 70
-        draw.line((margin, y, page_w - margin, y), fill="navy", width=3)
-        y += 35
-
-    def add_heading(text):
+        ensure(5); draw.text((margin,y), t, fill="navy", font=font_title); y += 60; draw.line((margin,y,page_w-margin,y), fill="navy", width=3); y += 35
+    def heading(t):
         nonlocal y
-        ensure_space(80)
-        draw.text((margin, y), text, fill="darkblue", font=font_h)
-        y += title_gap
-
-    def add_table(rows):
+        ensure(3); draw.text((margin,y), t, fill="darkblue", font=font_h); y += 45
+    def table(rows):
         nonlocal y
-        col1 = margin
-        col2 = margin + 390
-        row_h = 48
-        ensure_space(row_h * (len(rows) + 1) + 20)
-        for i, row in enumerate(rows):
-            bg = (220, 235, 255) if i == 0 else (250, 250, 250)
-            draw.rectangle((margin, y, page_w - margin, y + row_h), fill=bg, outline="gray")
-            draw.line((col2 - 15, y, col2 - 15, y + row_h), fill="gray", width=1)
-            f = font_small if i else font_b
-            draw.text((col1 + 10, y + 12), str(row[0])[:42], fill="black", font=f)
-            draw.text((col2, y + 12), str(row[1])[:70], fill="black", font=f)
+        row_h=48; ensure(len(rows)+2)
+        for i,row in enumerate(rows):
+            fill=(220,235,255) if i==0 else (250,250,250)
+            draw.rectangle((margin,y,page_w-margin,y+row_h), fill=fill, outline="gray")
+            draw.line((margin+390,y,margin+390,y+row_h), fill="gray")
+            f=font_small if i else font_b
+            draw.text((margin+10,y+12), str(row[0])[:38], fill="black", font=f)
+            draw.text((margin+410,y+12), str(row[1])[:72], fill="black", font=f)
             y += row_h
         y += 20
-
-    # Cover / index
-    add_title("SCADA Dynamic Pricing, Smart Meter, Solar DER and Predictive Maintenance Report")
-    add_heading("Index")
-    add_text("1. Abstract\n2. Introduction\n3. Saudi Tariff and Monthly-vs-Daily Baseline Model\n4. Smart Meter and Fairness Conditions\n5. Solar DER and Net Support\n6. Crisis Simulation\n7. Predictive Maintenance\n8. Tables, Graph Choices and Design Explanation\n9. Conclusion")
-
-    # Simple schematic
-    ensure_space(360)
-    x0, y0 = margin, y
-    boxes = [
-        (x0, y0, x0+230, y0+90, "Smart Meter"),
-        (x0+300, y0, x0+530, y0+90, "SCADA Logic"),
-        (x0+600, y0, x0+830, y0+90, "Billing / Tariff"),
-        (x0+900, y0, x0+1070, y0+90, "Grid Stability"),
-        (x0+300, y0+170, x0+530, y0+260, "Solar DER"),
-        (x0+600, y0+170, x0+900, y0+260, "Predictive Maintenance"),
-    ]
-    for bx1, by1, bx2, by2, label in boxes:
-        draw.rectangle([bx1, by1, bx2, by2], outline="navy", width=3, fill=(230,240,255))
-        draw.text((bx1+18, by1+30), label, fill="black", font=font_small)
-    draw.line((x0+230,y0+45,x0+300,y0+45), fill="black", width=3)
-    draw.line((x0+530,y0+45,x0+600,y0+45), fill="black", width=3)
-    draw.line((x0+830,y0+45,x0+900,y0+45), fill="black", width=3)
-    draw.line((x0+415,y0+90,x0+415,y0+170), fill="black", width=3)
-    draw.line((x0+715,y0+90,x0+715,y0+170), fill="black", width=3)
+    title("SCADA Dynamic Pricing, Smart Meter, Solar DER and Predictive Maintenance Report")
+    heading("Index")
+    text("1. Abstract\n2. Introduction\n3. Saudi Tariff and Monthly-vs-Daily Baseline Model\n4. Smart Meter and Fairness Conditions\n5. Solar DER and Net Support\n6. Crisis Simulation\n7. Predictive Maintenance\n8. Tables, Graph Choices and Design Explanation\n9. Conclusion")
+    ensure(10)
+    x0,y0=margin,y
+    boxes=[(x0,y0,x0+230,y0+90,"Smart Meter"),(x0+300,y0,x0+530,y0+90,"SCADA Logic"),(x0+600,y0,x0+830,y0+90,"Billing / Tariff"),(x0+900,y0,x0+1070,y0+90,"Grid Stability"),(x0+300,y0+170,x0+530,y0+260,"Solar DER"),(x0+600,y0+170,x0+900,y0+260,"Predictive Maintenance")]
+    for bx1,by1,bx2,by2,label in boxes:
+        draw.rectangle((bx1,by1,bx2,by2), outline="navy", width=3, fill=(230,240,255)); draw.text((bx1+15,by1+30), label, fill="black", font=font_small)
     y += 310
-
-    add_page()
-
-    add_heading("Abstract")
-    add_text("This report documents the SCADA simulation logic, including Saudi residential and commercial monthly tariff rules, daily peak-event baseline conversion, smart meter load shedding, premium versus penalty separation, solar DER support, crisis simulation, and predictive maintenance using P-F curve concepts.")
-
-    add_heading("Introduction")
-    add_text("The system models a utility-side SCADA scenario where monthly approved baselines are converted into daily peak-event limits. This avoids unrealistic daily scenarios using full monthly kWh values. The simulator supports customer autonomy, last-resort fair settlement, medical-device charity support, company growth discounts, solar self-consumption, and solar export credit.")
-
-    add_heading("Saudi Tariff and Baseline Model")
-    add_text("Residential billing is monthly: 0.18 SAR/kWh up to 6,000 kWh/month and 0.30 SAR/kWh above 6,000 kWh/month. Commercial billing is monthly: 0.22 SAR/kWh up to 6,000 kWh/month and 0.32 SAR/kWh above 6,000 kWh/month. SCADA peak events use daily baseline = monthly approved baseline / 30.")
-    add_table([
-        ["Item", "Value"],
-        ["Residential Tier 1", "0.18 SAR/kWh up to 6,000 kWh/month"],
-        ["Residential Tier 2", "0.30 SAR/kWh above 6,000 kWh/month"],
-        ["Commercial Tier 1", "0.22 SAR/kWh up to 6,000 kWh/month"],
-        ["Commercial Tier 2", "0.32 SAR/kWh above 6,000 kWh/month"],
-        ["Daily peak baseline", "Company approved monthly baseline / 30"],
-    ])
-
-    add_heading("Smart Meter and Fairness Conditions")
-    add_text("The smart meter uses appliance quantity, kW per unit, connection status, preservation limits, and priority order. Lower priority numbers are shed earlier. Protected and critical loads remain connected unless the table is manually edited.")
-    add_text("Premium and penalty are mutually exclusive. If the customer refuses disconnection and has signed premium preservation, premium pricing applies. If the customer is above the daily baseline without that premium agreement, the event is treated as penalty behavior instead.")
-
-    add_heading("Solar DER and Net Support")
-    add_text("Solar DER reduces billable monthly consumption through self-consumption. If export is enabled during peak stress, surplus generation is credited to the bill. During a daily peak event, solar peak energy can cover above-baseline demand. If solar fully covers the above-baseline amount, the timer is disabled because the customer is not depending on grid energy above the approved daily baseline.")
-
-    add_heading("Crisis Simulation")
-    add_text("The crisis model compares required grid support, actual load shed, solar support, maximum controllable shed, and final net grid load. The crisis is stable only when shed kW plus solar support reaches or exceeds the required support target.")
-
-    add_heading("Predictive Maintenance")
-    add_text("The maintenance page tracks grid assets such as transformers, breakers, feeders, switchgear, and distribution panels. It reports condition, predicted remaining useful life, failure risk, P point, F point, and suggested maintenance urgency. Component-level indicators identify whether insulation, thermal system, vibration, breaker operations, or fault history need maintenance soon.")
-
-    add_heading("Tables, Graph Choices and Design Explanation")
-    add_text("Tables are used for billing transparency, fairness condition evaluation, solar credit accounting, appliance shedding decisions, compound estimates, and maintenance status. Bar charts are used for unit reduction, kW reduction, bill components, compound kWh, and crisis feasibility because these clearly compare before/after quantities and required/actual support.")
-
-    add_heading("Conclusion")
-    add_text("The final SCADA design separates monthly tariff/baseline billing from daily peak-event control. This makes scenarios realistic, prevents monthly kWh values from being used as daily emergency demand, supports solar DER customers fairly, and makes premium and penalty logic clear and non-overlapping.")
-
-    if img not in pages:
-        pages.append(img)
+    new_page()
+    heading("Abstract"); text("This report documents the SCADA simulation logic, including Saudi monthly tariff rules, daily peak-event baseline conversion, smart meter load shedding, premium versus penalty separation, solar DER support, crisis simulation, and predictive maintenance.")
+    heading("Introduction"); text("The system converts monthly approved baselines into daily peak-event limits so daily scenarios are realistic. The simulator supports autonomy, Last Resort fair settlement, medical-device charity support, company growth discounts, solar self-consumption, and solar export credit.")
+    heading("Saudi Tariff and Baseline Model"); text("Residential billing is monthly: 0.18 SAR/kWh up to 6,000 kWh/month and 0.30 SAR/kWh above 6,000 kWh/month. Commercial billing is monthly: 0.22 SAR/kWh up to 6,000 kWh/month and 0.32 SAR/kWh above 6,000 kWh/month. SCADA peak events use daily baseline = monthly approved baseline / 30.")
+    table([["Item","Value"],["Residential Tier 1","0.18 SAR/kWh up to 6,000 kWh/month"],["Residential Tier 2","0.30 SAR/kWh above 6,000 kWh/month"],["Commercial Tier 1","0.22 SAR/kWh up to 6,000 kWh/month"],["Commercial Tier 2","0.32 SAR/kWh above 6,000 kWh/month"],["Daily peak baseline","Company approved monthly baseline / 30"]])
+    heading("Smart Meter and Fairness Conditions"); text("The smart meter uses appliance quantity, kW per unit, connection status, preservation limits, and priority order. Premium and penalty are mutually exclusive: signed premium preservation means premium pricing; no premium agreement with above-baseline behavior means penalty behavior.")
+    heading("Solar DER and Net Support"); text("Solar DER reduces billable monthly consumption through self-consumption. Exported surplus during peak stress creates bill credit. Solar peak support can also reduce net grid-dependent daily peak usage and stop the timer if the home stays within the daily baseline.")
+    heading("Crisis Simulation"); text("The crisis model compares required grid support, load shed, solar support, maximum controllable shed, and final net grid load. The crisis is stable only when shed kW plus solar support reaches the required target.")
+    heading("Predictive Maintenance"); text("The maintenance page reports asset condition, RUL, risk, P point, F point, and a component maintenance-soon table for insulation, thermal system, vibration, breaker operations, and fault history.")
+    heading("Conclusion"); text("The final design separates monthly billing from daily peak control, supports solar DER customers fairly, and makes premium and penalty logic clear and non-overlapping.")
+    pages.append(img)
     pages[0].save(report_path, save_all=True, append_images=pages[1:])
     return report_path
 
@@ -3434,6 +3351,16 @@ user_failed_to_respond = st.checkbox(
     value=False
 )
 
+premium_preservation_agreement = st.checkbox(
+    "Premium preservation agreement signed for uninterrupted above-baseline usage",
+    value=bool(st.session_state.get("premium_preservation_agreement", True)),
+    help=(
+        "If ON and the customer refuses disconnection, above-baseline daily peak usage is billed as premium service. "
+        "If OFF, above-baseline daily peak usage is treated as penalty behavior. Premium and penalty do not apply together."
+    )
+)
+st.session_state.premium_preservation_agreement = premium_preservation_agreement
+
 
 # =========================================================
 # HOUSEHOLD INPUTS
@@ -3496,6 +3423,10 @@ fraud_guard_df["Daily Peak Baseline kWh"] = fraud_guard_df["Company Approved Bas
 st.subheader("Company Statistical Baseline / Fraud Detection")
 st.info("Company-approved baseline protects the utility from inflated historical baselines by comparing history against house area, occupants, and declared appliance/device mix.")
 st.dataframe(fraud_guard_df, use_container_width=True)
+st.info(
+    "Important: the Saudi tariff and approved baseline are monthly. The daily peak event uses monthly baseline / 30. "
+    "Example: 980 kWh/month becomes 32.67 kWh/day. If daily peak usage is 50 kWh/day, the timer should run unless solar covers the extra grid-dependent usage."
+)
 
 # =========================================================
 # PERSON SELECTION AND USAGE
@@ -3595,13 +3526,11 @@ solar_summary_cols[3].metric("Solar Export", "Enabled" if selected_solar_profile
 # =========================================================
 
 settlement_rows = []
-
-for client_name, baseline_value, requested_value in [
-    ("Person A", baseline_a, requested_usage_a),
-    ("Person B", baseline_b, requested_usage_b)
+for client_name, monthly_baseline_value, daily_baseline_value, requested_value in [
+    ("Person A", baseline_a, baseline_a_daily, requested_usage_a),
+    ("Person B", baseline_b, baseline_b_daily, requested_usage_b)
 ]:
-    surplus = max(requested_value - baseline_value, 0)
-
+    surplus = max(requested_value - daily_baseline_value, 0)
     if requested_value > 0:
         forced_percent = (surplus / requested_value) * 100
     else:
@@ -3609,15 +3538,15 @@ for client_name, baseline_value, requested_value in [
 
     settlement_rows.append({
         "Client": client_name,
-        "Baseline kWh": baseline_value,
-        "Requested kWh": requested_value,
-        "Surplus Above Baseline kWh": surplus,
+        "Monthly Approved Baseline kWh": monthly_baseline_value,
+        "Daily Peak Baseline kWh": daily_baseline_value,
+        "Requested Daily Peak kWh": requested_value,
+        "Surplus Above Daily Baseline kWh": surplus,
         "Forced Fair Reduction %": forced_percent,
-        "Settlement Status": "High load - force reduction" if surplus > 0 else "Within baseline - no forced reduction"
+        "Settlement Status": "High daily peak load - force reduction" if surplus > 0 else "Within daily peak baseline - no forced reduction"
     })
 
 settlement_df = pd.DataFrame(settlement_rows)
-
 
 # =========================================================
 # TIMER AND FORCE SETTLEMENT LOGIC
@@ -3654,17 +3583,11 @@ forced_fair_settlement_active = (
     and selected_surplus > 0
 )
 
-# TIMER RULE:
-# Timer is allowed ONLY when:
-# 1) stress is active
-# 2) last-resort mode is OFF
-# 3) selected customer is above baseline
-#
-# Timer must NOT run when:
-# - last resort is ON
-# - customer is within/below baseline
-# - stress or peak is OFF
-timer_should_run = (
+# TIMER RULE FOR DAILY PEAK EVENT:
+# Timer starts whenever NET grid-dependent daily peak usage is above the daily approved baseline.
+# Solar can stop the timer only if solar reduces net grid-dependent usage to/below baseline.
+# Premium agreement changes billing treatment, but it does not hide the timer.
+timer_should_run = bool(
     stress_active
     and not last_resort_mode_active
     and customer_above_baseline
@@ -3677,7 +3600,9 @@ timer_signature = (
     f"above_baseline={customer_above_baseline}|"
     f"requested={round(requested_usage, 2)}|"
     f"baseline={round(selected_baseline, 2)}|"
-    f"deadline={response_deadline_minutes}"
+    f"deadline={response_deadline_minutes}|"
+    f"refuse={refuse_disconnect}|"
+    f"premium_agreement={premium_preservation_agreement}"
 )
 
 deadline_penalty_active, timer_status = deadline_timer_engine(
@@ -3685,6 +3610,14 @@ deadline_penalty_active, timer_status = deadline_timer_engine(
     deadline_minutes=response_deadline_minutes,
     force_settlement_active=last_resort_mode_active,
     timer_signature=timer_signature
+)
+
+st.caption(
+    f"Timer diagnostic: daily baseline={selected_baseline:.2f} kWh/day | "
+    f"requested peak={requested_usage:.2f} kWh/day | "
+    f"solar peak support={solar_peak_event_support_kwh:.2f} kWh | "
+    f"net grid-dependent peak={net_requested_usage_for_baseline:.2f} kWh/day | "
+    f"timer_should_run={timer_should_run}"
 )
 
 # =========================================================
@@ -3749,7 +3682,7 @@ if company_force_fair_settlement and grid_stress and peak_event:
         effective_voluntary_reduction_percent = 0
         effective_mandatory_reduction_percent = 0
         forced_fair_settlement_reason = (
-            "Selected customer is within own historical baseline. No forced disconnection required."
+            "Selected customer is within own daily peak baseline after solar support. No forced disconnection required."
         )
     else:
         forced_reduction_percent = (selected_surplus / max(requested_usage, 0.001)) * 100
@@ -3986,6 +3919,10 @@ ignored_request_penalty_active = bool(
 )
 if ignored_request_penalty_active:
     timer_status = "User ignored company request. Immediate delay penalty is active for this calculation."
+
+# Safety fallback: prevents NameError if Streamlit state is restored from an older run.
+if "premium_preservation_agreement" not in locals():
+    premium_preservation_agreement = bool(st.session_state.get("premium_preservation_agreement", True))
 
 billing = billing_engine(
     baseline=selected_monthly_baseline,
