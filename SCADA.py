@@ -195,6 +195,12 @@ SAUDI_VILLA_HIGH_KWH = 4000
 SAUDI_AVERAGE_HOME_LOW_KWH = 2000
 SAUDI_AVERAGE_HOME_HIGH_KWH = 2500
 COMPANY_GROWTH_DISCOUNT_RATE = 0.10
+SOLAR_PERFORMANCE_RATIO = 0.78
+SOLAR_PEAK_AVAILABILITY_FACTOR = 0.85
+SOLAR_OFF_PEAK_AVAILABILITY_FACTOR = 0.45
+SOLAR_DEFAULT_PEAK_SUN_HOURS = 5.5
+SOLAR_EXPORT_CREDIT_RATE = 0.18
+
 
 PRIORITY_MIN = 1
 PRIORITY_MAX = 10
@@ -384,6 +390,26 @@ if "override_house_size" not in st.session_state:
     st.session_state.override_house_size = 120
 if "override_occupants" not in st.session_state:
     st.session_state.override_occupants = 3
+if "person_a_has_solar" not in st.session_state:
+    st.session_state.person_a_has_solar = False
+if "person_b_has_solar" not in st.session_state:
+    st.session_state.person_b_has_solar = False
+if "person_a_solar_capacity_kw" not in st.session_state:
+    st.session_state.person_a_solar_capacity_kw = 6.0
+if "person_b_solar_capacity_kw" not in st.session_state:
+    st.session_state.person_b_solar_capacity_kw = 12.0
+if "person_a_solar_peak_sun_hours" not in st.session_state:
+    st.session_state.person_a_solar_peak_sun_hours = SOLAR_DEFAULT_PEAK_SUN_HOURS
+if "person_b_solar_peak_sun_hours" not in st.session_state:
+    st.session_state.person_b_solar_peak_sun_hours = SOLAR_DEFAULT_PEAK_SUN_HOURS
+if "person_a_solar_self_use_percent" not in st.session_state:
+    st.session_state.person_a_solar_self_use_percent = 70
+if "person_b_solar_self_use_percent" not in st.session_state:
+    st.session_state.person_b_solar_self_use_percent = 70
+if "person_a_solar_export_enabled" not in st.session_state:
+    st.session_state.person_a_solar_export_enabled = True
+if "person_b_solar_export_enabled" not in st.session_state:
+    st.session_state.person_b_solar_export_enabled = True
 
 # Stores the latest non-forced scenario so Last Resort can show a simple
 # BEFORE vs AFTER comparison at the end of the page.
@@ -1499,6 +1525,49 @@ def estimate_saudi_monthly_baseline_from_household(household_df):
     return max(estimated, 0.5)
 
 
+def calculate_solar_profile(has_solar, capacity_kw, peak_sun_hours, self_use_percent, export_enabled, stress_active=False, peak_event=False):
+    has_solar = bool(has_solar)
+    capacity_kw = max(float(capacity_kw), 0.0)
+    peak_sun_hours = max(float(peak_sun_hours), 0.0)
+    self_use_percent = min(max(float(self_use_percent), 0.0), 100.0)
+    if not has_solar or capacity_kw <= 0:
+        return {
+            "Has Solar": False,
+            "Solar Capacity kW": 0.0,
+            "Peak Available Solar kW": 0.0,
+            "Monthly Solar Generation kWh": 0.0,
+            "Self Use Percent": self_use_percent,
+            "Export Enabled": False,
+            "Export Credit Rate SAR/kWh": SOLAR_EXPORT_CREDIT_RATE,
+        }
+    availability_factor = SOLAR_PEAK_AVAILABILITY_FACTOR if (stress_active or peak_event) else SOLAR_OFF_PEAK_AVAILABILITY_FACTOR
+    peak_available_kw = capacity_kw * SOLAR_PERFORMANCE_RATIO * availability_factor
+    monthly_generation_kwh = capacity_kw * peak_sun_hours * 30 * SOLAR_PERFORMANCE_RATIO
+    return {
+        "Has Solar": True,
+        "Solar Capacity kW": capacity_kw,
+        "Peak Available Solar kW": peak_available_kw,
+        "Monthly Solar Generation kWh": monthly_generation_kwh,
+        "Self Use Percent": self_use_percent,
+        "Export Enabled": bool(export_enabled),
+        "Export Credit Rate SAR/kWh": SOLAR_EXPORT_CREDIT_RATE,
+    }
+
+
+def get_selected_solar_inputs(selected_person):
+    prefix = "person_a" if selected_person == "Person A" else "person_b"
+    return calculate_solar_profile(
+        has_solar=st.session_state.get(f"{prefix}_has_solar", False),
+        capacity_kw=st.session_state.get(f"{prefix}_solar_capacity_kw", 0.0),
+        peak_sun_hours=st.session_state.get(f"{prefix}_solar_peak_sun_hours", SOLAR_DEFAULT_PEAK_SUN_HOURS),
+        self_use_percent=st.session_state.get(f"{prefix}_solar_self_use_percent", 70),
+        export_enabled=st.session_state.get(f"{prefix}_solar_export_enabled", True),
+        stress_active=False,
+        peak_event=False,
+    )
+
+
+
 def build_static_compound_summary():
     rows = []
 
@@ -2420,6 +2489,7 @@ Use this page to explain the synthetic dataset and ML/baseline logic.
 - **Saudi tariff:** residential 1–6,000 kWh/month uses 0.18 SAR/kWh and above 6,000 kWh/month uses 0.30 SAR/kWh.
 - **Company fraud guard:** historical baseline is not trusted alone; the company-approved baseline is checked against property size, occupants, and device mix.
 - **Grid support discount:** applied only if required reduction is actually achieved.
+- **Hybrid solar homes:** solar self-consumption reduces billable usage, surplus export during peak stress creates a bill credit, and sufficient peak solar support can keep the home operating during Last Resort/crisis conditions.
 - **Company growth mode:** applies a cheaper-company discount to the whole bill after penalties and charges when growth mode and growth bonus are enabled.
 - **Last Resort:** company can force fair settlement only during real stress/peak situations; users within approved baseline are protected.
 
@@ -2664,16 +2734,11 @@ if page == "Crisis Live Simulation":
     st.title("Crisis Live Simulation")
     st.markdown("""
 <div class="scada-card">
-<div class="big-status">Live Crisis Simulator - Feasibility First</div>
-This page checks whether the selected appliance table has enough controllable kW to satisfy a crisis target.
-It now separates <b>physical possibility</b>, <b>selected action mode</b>, and <b>actual achieved result</b>.
+<div class="big-status">Live Crisis Simulator - Feasibility First + Solar DER</div>
+This page checks whether appliance shedding plus hybrid solar grid support can satisfy a crisis target.
 </div>
     """, unsafe_allow_html=True)
-
-    st.info(
-        "Crisis stable means actual shed kW reached the required crisis shed kW. "
-        "If controllable loads are protected, disconnected, preserved, or too small, the page will show that the crisis target is not fully satisfied."
-    )
+    st.info("Crisis stability now counts both actual shed kW and solar DER support kW during peak stress.")
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -2685,20 +2750,26 @@ It now separates <b>physical possibility</b>, <b>selected action mode</b>, and <
     with c4:
         min_service = st.checkbox("Minimum service preservation", value=True)
 
+    st.subheader("Hybrid Solar Crisis Support")
+    sc1, sc2, sc3, sc4 = st.columns(4)
+    with sc1:
+        crisis_solar_enabled = st.checkbox("Hybrid home has solar support", value=False)
+    with sc2:
+        crisis_solar_capacity_kw = st.number_input("Crisis Solar Capacity kW", min_value=0.0, value=10.0, step=0.5)
+    with sc3:
+        crisis_solar_peak_factor = st.slider("Solar Peak Availability %", 0, 100, int(SOLAR_PEAK_AVAILABILITY_FACTOR * 100), 1)
+    with sc4:
+        crisis_solar_export_enabled = st.checkbox("Solar can export to grid in crisis", value=True)
+
     st.subheader("Crisis Input Scenario")
     crisis_input_mode = st.radio(
         "Choose crisis test input",
-        [
-            "Use current Smart Meter Override Page table",
-            "Built-in impossible crisis test: protected/zero controllable load",
-            "Temporary crisis editor only for this page",
-        ],
+        ["Use current Smart Meter Override Page table", "Built-in impossible crisis test: protected/zero controllable load", "Temporary crisis editor only for this page"],
         index=0,
         help="The temporary editor does not overwrite the Smart Meter Override Page table."
     )
 
     base_crisis_config = ensure_appliance_columns(st.session_state.appliance_config.copy())
-
     if crisis_input_mode == "Built-in impossible crisis test: protected/zero controllable load":
         crisis_input_df = base_crisis_config.copy()
         non_protected_mask = crisis_input_df["Load Category"] != "Critical / Never Disconnect"
@@ -2706,7 +2777,7 @@ It now separates <b>physical possibility</b>, <b>selected action mode</b>, and <
         crisis_input_df.loc[non_protected_mask, "Connected"] = False
         crisis_input_df.loc[non_protected_mask, "Preserve Minimum Units"] = 0
         crisis_input_df = apply_load_category_priority_rules(crisis_input_df)
-        st.warning("Impossible crisis test is active. This should normally fail a non-zero crisis target.")
+        st.warning("Impossible crisis test is active. Solar can still help if solar export/support is sufficient.")
     elif crisis_input_mode == "Temporary crisis editor only for this page":
         st.info("Edit this temporary table to test crisis edge cases. It does not overwrite the saved smart-meter table.")
         crisis_input_df = st.data_editor(
@@ -2736,8 +2807,13 @@ It now separates <b>physical possibility</b>, <b>selected action mode</b>, and <
     crisis_load_df = calculate_current_connected_load(crisis_input_df)
     crisis_original_kw = float(crisis_load_df["Connected Load kW"].sum())
     crisis_required_shed_kw = crisis_original_kw * crisis_reduction / 100 if crisis_original_kw > 0 else 0
+    crisis_solar_support_kw = 0.0
+    if crisis_solar_enabled and crisis_solar_export_enabled:
+        crisis_solar_support_kw = crisis_solar_capacity_kw * SOLAR_PERFORMANCE_RATIO * (crisis_solar_peak_factor / 100)
+    crisis_effective_required_shed_kw = max(crisis_required_shed_kw - crisis_solar_support_kw, 0)
+    crisis_effective_reduction_percent = (crisis_effective_required_shed_kw / crisis_original_kw * 100) if crisis_original_kw > 0 else 0
+    solar_sufficient_for_crisis = bool(crisis_required_shed_kw > 0 and crisis_solar_support_kw >= crisis_required_shed_kw)
 
-    # Maximum physical controllability check. This is always forced to 100% to reveal the upper limit.
     max_crisis_df, max_original_kw, max_final_kw, max_achieved, max_msg = smart_meter_shed_load(
         appliance_df=crisis_input_df,
         requested_reduction_percent=100,
@@ -2752,14 +2828,14 @@ It now separates <b>physical possibility</b>, <b>selected action mode</b>, and <
     )
     crisis_max_controllable_shed_kw = float(max_crisis_df["Shed kW"].sum())
 
-    if force_crisis:
+    if force_crisis and crisis_effective_reduction_percent > 0:
         crisis_df, _, crisis_final_kw, crisis_achieved, crisis_msg = smart_meter_shed_load(
             appliance_df=crisis_input_df,
-            requested_reduction_percent=crisis_reduction,
+            requested_reduction_percent=crisis_effective_reduction_percent,
             policy_mode=crisis_policy,
             refuse_disconnect=False,
             climate_mode=st.session_state.climate_mode,
-            mandatory_minimum_percent=crisis_reduction,
+            mandatory_minimum_percent=crisis_effective_reduction_percent,
             user_failed_to_respond=True,
             enforcement_enabled=True,
             minimum_service_enabled=min_service,
@@ -2768,59 +2844,61 @@ It now separates <b>physical possibility</b>, <b>selected action mode</b>, and <
     else:
         crisis_df, _, crisis_final_kw, crisis_achieved, crisis_msg = smart_meter_shed_load(
             appliance_df=crisis_input_df,
-            requested_reduction_percent=crisis_reduction,
+            requested_reduction_percent=crisis_effective_reduction_percent,
             policy_mode=crisis_policy,
             refuse_disconnect=False,
             climate_mode=st.session_state.climate_mode,
-            mandatory_minimum_percent=crisis_reduction,
+            mandatory_minimum_percent=crisis_effective_reduction_percent,
             user_failed_to_respond=False,
             enforcement_enabled=False,
             minimum_service_enabled=min_service,
             force_mode=False,
         )
-        crisis_msg = "Simulation only: Execute crisis shedding now is OFF. Result uses normal policy mode, not emergency forced mode."
+        if solar_sufficient_for_crisis:
+            crisis_msg = "Solar DER support is sufficient, so the hybrid home can keep operating without forced load shedding."
+        elif not force_crisis:
+            crisis_msg = "Simulation only: Execute crisis shedding now is OFF."
 
     crisis_actual_shed_kw = float(crisis_df["Shed kW"].sum())
+    crisis_actual_grid_support_kw = crisis_actual_shed_kw + crisis_solar_support_kw
     crisis_final_kw = max(crisis_original_kw - crisis_actual_shed_kw, 0)
-    crisis_achieved = (crisis_actual_shed_kw / crisis_original_kw * 100) if crisis_original_kw > 0 else 0
+    crisis_net_grid_load_after_solar_kw = max(crisis_final_kw - crisis_solar_support_kw, 0)
+    crisis_achieved = (crisis_actual_grid_support_kw / crisis_original_kw * 100) if crisis_original_kw > 0 else 0
 
     tolerance_kw = 1e-6
     crisis_no_load = crisis_original_kw <= tolerance_kw
     crisis_no_target = crisis_reduction <= 0
-    crisis_physically_possible = crisis_max_controllable_shed_kw + tolerance_kw >= crisis_required_shed_kw
-    crisis_target_met = crisis_actual_shed_kw + tolerance_kw >= crisis_required_shed_kw
-    crisis_stable = (not crisis_no_load) and (crisis_no_target or (crisis_physically_possible and crisis_target_met and force_crisis))
+    crisis_physically_possible = (crisis_max_controllable_shed_kw + crisis_solar_support_kw + tolerance_kw) >= crisis_required_shed_kw
+    crisis_target_met = crisis_actual_grid_support_kw + tolerance_kw >= crisis_required_shed_kw
+    crisis_stable = (not crisis_no_load) and (crisis_no_target or (crisis_physically_possible and crisis_target_met and (force_crisis or solar_sufficient_for_crisis)))
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Original Load", f"{crisis_original_kw:.2f} kW")
-    m2.metric("Required Shed", f"{crisis_required_shed_kw:.2f} kW")
-    m3.metric("Actual Shed", f"{crisis_actual_shed_kw:.2f} kW")
-    m4.metric("Achieved Reduction", f"{crisis_achieved:.2f}%")
-
+    m2.metric("Required Grid Support", f"{crisis_required_shed_kw:.2f} kW")
+    m3.metric("Load Shed", f"{crisis_actual_shed_kw:.2f} kW")
+    m4.metric("Solar Crisis Support", f"{crisis_solar_support_kw:.2f} kW")
     m5, m6, m7, m8 = st.columns(4)
-    m5.metric("Final Load", f"{crisis_final_kw:.2f} kW")
-    m6.metric("Max Controllable Shed", f"{crisis_max_controllable_shed_kw:.2f} kW")
-    m7.metric("Crisis Target", f"{crisis_reduction:.0f}%")
-    m8.metric("Emergency Execution", "ON" if force_crisis else "OFF")
+    m5.metric("Actual Grid Support", f"{crisis_actual_grid_support_kw:.2f} kW")
+    m6.metric("Max Shed + Solar", f"{crisis_max_controllable_shed_kw + crisis_solar_support_kw:.2f} kW")
+    m7.metric("Net Grid Load After Solar", f"{crisis_net_grid_load_after_solar_kw:.2f} kW")
+    m8.metric("Solar Sufficient", "YES" if solar_sufficient_for_crisis else "NO")
 
     if crisis_no_load:
         st.error("Crisis target is not fully satisfied: there is no active connected load to control.")
     elif crisis_no_target:
         st.info("No crisis reduction target was requested. Set the crisis target above 0% to test stability.")
     elif not crisis_physically_possible:
-        st.error(
-            f"Crisis target is physically impossible with current controllable loads. Required shed is {crisis_required_shed_kw:.2f} kW, "
-            f"but maximum controllable shed is only {crisis_max_controllable_shed_kw:.2f} kW."
-        )
+        st.error(f"Crisis target is physically impossible. Required support is {crisis_required_shed_kw:.2f} kW, but shed + solar can only provide {(crisis_max_controllable_shed_kw + crisis_solar_support_kw):.2f} kW.")
+    elif solar_sufficient_for_crisis:
+        st.success("Solar support is sufficient. Hybrid home can remain operating during crisis/last-resort condition without additional shedding.")
     elif not force_crisis:
-        st.warning("Crisis target may be physically possible, but emergency execution is OFF. Turn it ON to run forced crisis shedding.")
+        st.warning("Solar helps, but emergency execution is OFF. Turn it ON to combine solar support with forced shedding.")
     elif not crisis_target_met:
-        st.warning("Crisis target is not fully satisfied. Check priorities, preserved minimum units, protected loads, and available controllable kW.")
+        st.warning("Crisis target is not fully satisfied. Increase solar support, add controllable loads, or reduce protected/preserved load.")
     else:
-        st.success("Crisis target satisfied. Grid is stable in this simulation because actual shed kW reached the required crisis shed kW.")
+        st.success("Crisis target satisfied. Grid is stable because shed kW plus solar support reached the required support.")
 
     st.info(crisis_msg)
-
     st.subheader("Crisis Result Table")
     crisis_display_df = crisis_df.copy()
     if "Remaining Load kW" not in crisis_display_df.columns:
@@ -2830,10 +2908,12 @@ It now separates <b>physical possibility</b>, <b>selected action mode</b>, and <
     st.subheader("Crisis Feasibility Summary")
     crisis_summary_df = pd.DataFrame([
         {"Metric": "Original Load kW", "Value": crisis_original_kw},
-        {"Metric": "Required Shed kW", "Value": crisis_required_shed_kw},
+        {"Metric": "Required Grid Support kW", "Value": crisis_required_shed_kw},
+        {"Metric": "Solar Support kW", "Value": crisis_solar_support_kw},
+        {"Metric": "Effective Required Shed after Solar kW", "Value": crisis_effective_required_shed_kw},
         {"Metric": "Actual Shed kW", "Value": crisis_actual_shed_kw},
+        {"Metric": "Actual Shed + Solar kW", "Value": crisis_actual_grid_support_kw},
         {"Metric": "Maximum Controllable Shed kW", "Value": crisis_max_controllable_shed_kw},
-        {"Metric": "Final Load kW", "Value": crisis_final_kw},
         {"Metric": "Physically Possible", "Value": crisis_physically_possible},
         {"Metric": "Target Met", "Value": crisis_target_met},
         {"Metric": "Crisis Stable", "Value": crisis_stable},
@@ -2841,21 +2921,8 @@ It now separates <b>physical possibility</b>, <b>selected action mode</b>, and <
     st.dataframe(crisis_summary_df, use_container_width=True)
 
     fig_crisis_kw = go.Figure()
-    fig_crisis_kw.add_trace(go.Bar(
-        x=["Required Shed", "Actual Shed", "Max Controllable Shed"],
-        y=[crisis_required_shed_kw, crisis_actual_shed_kw, crisis_max_controllable_shed_kw],
-        marker_color=["orange", "lime" if crisis_target_met else "red", "deepskyblue"],
-        text=[round(crisis_required_shed_kw, 2), round(crisis_actual_shed_kw, 2), round(crisis_max_controllable_shed_kw, 2)],
-        textposition="auto"
-    ))
-    fig_crisis_kw.update_layout(
-        title="Crisis Feasibility: Required vs Actual vs Maximum Controllable Shed",
-        xaxis_title="Crisis Metric",
-        yaxis_title="kW",
-        template="plotly_dark",
-        height=520,
-        showlegend=False,
-    )
+    fig_crisis_kw.add_trace(go.Bar(x=["Required", "Solar", "Shed", "Shed + Solar", "Max Shed + Solar"], y=[crisis_required_shed_kw, crisis_solar_support_kw, crisis_actual_shed_kw, crisis_actual_grid_support_kw, crisis_max_controllable_shed_kw + crisis_solar_support_kw], marker_color=["orange", "gold", "red", "lime" if crisis_target_met else "tomato", "deepskyblue"], text=[round(crisis_required_shed_kw,2), round(crisis_solar_support_kw,2), round(crisis_actual_shed_kw,2), round(crisis_actual_grid_support_kw,2), round(crisis_max_controllable_shed_kw + crisis_solar_support_kw,2)], textposition="auto"))
+    fig_crisis_kw.update_layout(title="Crisis Feasibility with Solar DER Support", xaxis_title="Metric", yaxis_title="kW", template="plotly_dark", height=540, showlegend=False)
     st.plotly_chart(fig_crisis_kw, use_container_width=True)
 
     st.subheader("Unit Reduction Only")
@@ -2866,19 +2933,13 @@ It now separates <b>physical possibility</b>, <b>selected action mode</b>, and <
     fig_crisis_units.update_layout(title="Live Crisis Unit Reduction", barmode="group", template="plotly_dark", height=600, yaxis_title="Units")
     st.plotly_chart(fig_crisis_units, use_container_width=True)
 
-    st.subheader("Shed kW by Appliance")
-    fig_shed_kw = px.bar(crisis_display_df, x="Appliance", y="Shed kW", title="Crisis Shed kW by Appliance", text_auto=".2f")
-    fig_shed_kw.update_layout(template="plotly_dark", height=520, yaxis_title="Shed kW")
-    st.plotly_chart(fig_shed_kw, use_container_width=True)
-
     with st.expander("Why this crisis result happened"):
         st.write("Crisis stable:", crisis_stable)
         st.write("Physically possible:", crisis_physically_possible)
         st.write("Target met:", crisis_target_met)
+        st.write("Solar sufficient without shedding:", solar_sufficient_for_crisis)
         st.write("Emergency execution ON:", force_crisis)
-        st.write("Minimum service enabled:", min_service)
-        st.write("Crisis input mode:", crisis_input_mode)
-        st.write("Tip: If max controllable shed is below required shed, add controllable loads, reduce protected loads, lower preserved minimum units, or lower crisis target.")
+        st.write("Tip: Solar reduces the required shedding target first. If solar is insufficient, the smart meter sheds the remaining required kW.")
     st.stop()
 
 # =========================================================
@@ -2954,6 +3015,7 @@ if page == "Smart Meter Override Page":
     }])
     override_expected_baseline = calculate_engineering_baseline(override_household_df)
     st.metric("Smart Meter Statistical Expected Baseline", f"{override_expected_baseline:.2f} kWh")
+    st.info("Solar DER settings are configured in the SCADA Control Center for Person A and Person B, and are used in billing, Last Resort, and Crisis support calculations.")
 
     st.subheader("Edit Appliance Status and Load Category")
 
@@ -3280,6 +3342,24 @@ with mdb:
         help="Applies a charity discount and flags the customer as medically protected for billing review."
     )
 
+st.subheader("Hybrid Solar Home / Grid Export Support")
+st.info("Hybrid homes with solar panels can self-consume solar energy, export surplus during peak stress, earn bill credit, and reduce or avoid last-resort shedding if solar peak support is sufficient.")
+sa1, sa2 = st.columns(2)
+with sa1:
+    st.markdown("**Person A Solar DER**")
+    st.session_state.person_a_has_solar = st.checkbox("Person A has solar panels", value=st.session_state.person_a_has_solar)
+    st.session_state.person_a_solar_capacity_kw = st.number_input("Person A Solar Capacity kW", min_value=0.0, value=float(st.session_state.person_a_solar_capacity_kw), step=0.5)
+    st.session_state.person_a_solar_peak_sun_hours = st.number_input("Person A Peak Sun Hours / Day", min_value=0.0, value=float(st.session_state.person_a_solar_peak_sun_hours), step=0.1)
+    st.session_state.person_a_solar_self_use_percent = st.slider("Person A Solar Self-Use %", 0, 100, int(st.session_state.person_a_solar_self_use_percent), 1)
+    st.session_state.person_a_solar_export_enabled = st.checkbox("Person A export surplus to grid during peak", value=st.session_state.person_a_solar_export_enabled)
+with sa2:
+    st.markdown("**Person B Solar DER**")
+    st.session_state.person_b_has_solar = st.checkbox("Person B has solar panels", value=st.session_state.person_b_has_solar)
+    st.session_state.person_b_solar_capacity_kw = st.number_input("Person B Solar Capacity kW", min_value=0.0, value=float(st.session_state.person_b_solar_capacity_kw), step=0.5)
+    st.session_state.person_b_solar_peak_sun_hours = st.number_input("Person B Peak Sun Hours / Day", min_value=0.0, value=float(st.session_state.person_b_solar_peak_sun_hours), step=0.1)
+    st.session_state.person_b_solar_self_use_percent = st.slider("Person B Solar Self-Use %", 0, 100, int(st.session_state.person_b_solar_self_use_percent), 1)
+    st.session_state.person_b_solar_export_enabled = st.checkbox("Person B export surplus to grid during peak", value=st.session_state.person_b_solar_export_enabled)
+
 if selected_person == "Person A":
     selected_baseline = baseline_a
     requested_usage = requested_usage_a
@@ -3288,6 +3368,22 @@ else:
     selected_baseline = baseline_b
     requested_usage = requested_usage_b
     selected_household_df = person_b
+
+selected_solar_profile = get_selected_solar_inputs(selected_person)
+selected_solar_profile = calculate_solar_profile(
+    has_solar=selected_solar_profile["Has Solar"],
+    capacity_kw=selected_solar_profile["Solar Capacity kW"],
+    peak_sun_hours=SOLAR_DEFAULT_PEAK_SUN_HOURS if selected_solar_profile["Solar Capacity kW"] <= 0 else (st.session_state.person_a_solar_peak_sun_hours if selected_person == "Person A" else st.session_state.person_b_solar_peak_sun_hours),
+    self_use_percent=selected_solar_profile["Self Use Percent"],
+    export_enabled=selected_solar_profile["Export Enabled"],
+    stress_active=grid_stress and peak_event,
+    peak_event=peak_event,
+)
+solar_summary_cols = st.columns(4)
+solar_summary_cols[0].metric("Selected Solar Capacity", f"{selected_solar_profile['Solar Capacity kW']:.2f} kW")
+solar_summary_cols[1].metric("Peak Solar Available", f"{selected_solar_profile['Peak Available Solar kW']:.2f} kW")
+solar_summary_cols[2].metric("Monthly Solar Generation", f"{selected_solar_profile['Monthly Solar Generation kWh']:.0f} kWh")
+solar_summary_cols[3].metric("Solar Export", "Enabled" if selected_solar_profile["Export Enabled"] else "Disabled")
 
 
 # =========================================================
@@ -3601,6 +3697,22 @@ if len(wm_hm_debug) == 2:
             "If both are selected in the same priority tier and exact electrical tie, the no-name-bias rotation logic will rotate between them."
         )
 
+pre_shedding_load_df = calculate_current_connected_load(simulation_appliance_config)
+pre_shedding_original_kw = float(pre_shedding_load_df["Connected Load kW"].sum())
+solar_support_for_voluntary_kw = 0.0
+solar_support_for_mandatory_kw = 0.0
+solar_last_resort_support_active = False
+original_effective_voluntary_reduction_percent = effective_voluntary_reduction_percent
+original_effective_mandatory_reduction_percent = effective_mandatory_reduction_percent
+if selected_solar_profile["Has Solar"] and stress_active and pre_shedding_original_kw > 0:
+    voluntary_required_kw = pre_shedding_original_kw * effective_voluntary_reduction_percent / 100
+    mandatory_required_kw = pre_shedding_original_kw * effective_mandatory_reduction_percent / 100
+    solar_support_for_voluntary_kw = min(selected_solar_profile["Peak Available Solar kW"], voluntary_required_kw)
+    solar_support_for_mandatory_kw = min(selected_solar_profile["Peak Available Solar kW"], mandatory_required_kw)
+    effective_voluntary_reduction_percent = max((voluntary_required_kw - solar_support_for_voluntary_kw) / pre_shedding_original_kw * 100, 0)
+    effective_mandatory_reduction_percent = max((mandatory_required_kw - solar_support_for_mandatory_kw) / pre_shedding_original_kw * 100, 0)
+    solar_last_resort_support_active = bool(last_resort_mode_active and original_effective_voluntary_reduction_percent > 0 and effective_voluntary_reduction_percent == 0)
+
 shed_df, original_load_kw, final_load_kw, achieved_reduction_percent, enforcement_status = smart_meter_shed_load(
     appliance_df=simulation_appliance_config,
     requested_reduction_percent=effective_voluntary_reduction_percent,
@@ -3621,6 +3733,10 @@ shed_df, original_load_kw, final_load_kw, achieved_reduction_percent, enforcemen
     minimum_service_enabled=fair_conditions["minimum_service"],
     force_mode=forced_fair_settlement_active
 )
+if selected_solar_profile["Has Solar"] and stress_active:
+    enforcement_status += f" Solar DER supported {solar_support_for_voluntary_kw:.2f} kW of the requested reduction signal."
+    if solar_last_resort_support_active:
+        enforcement_status += " Solar support was sufficient, so the hybrid home can continue operating during Last Resort without load shedding."
 
 if original_load_kw > 0:
     usage_ratio = final_load_kw / original_load_kw
@@ -3633,6 +3749,19 @@ if forced_fair_settlement_active:
     final_usage = min(final_usage_raw, selected_baseline)
 else:
     final_usage = final_usage_raw
+
+final_usage_before_solar = final_usage
+solar_monthly_generation_kwh = selected_solar_profile["Monthly Solar Generation kWh"]
+solar_self_consumption_kwh = 0.0
+solar_export_kwh = 0.0
+solar_export_credit_sar = 0.0
+if selected_solar_profile["Has Solar"]:
+    solar_self_consumption_potential = solar_monthly_generation_kwh * selected_solar_profile["Self Use Percent"] / 100
+    solar_self_consumption_kwh = min(final_usage, solar_self_consumption_potential)
+    final_usage = max(final_usage - solar_self_consumption_kwh, 0)
+    if selected_solar_profile["Export Enabled"] and stress_active:
+        solar_export_kwh = max(solar_monthly_generation_kwh - solar_self_consumption_kwh, 0)
+        solar_export_credit_sar = solar_export_kwh * selected_solar_profile["Export Credit Rate SAR/kWh"]
 
 good_behavior_discount_rate = min(
     st.session_state.good_behavior_streak * GOOD_BEHAVIOR_STEP_DISCOUNT,
@@ -3660,6 +3789,11 @@ billing = billing_engine(
     forced_fair_settlement_active=forced_fair_settlement_active,
     good_behavior_discount_rate=good_behavior_discount_rate
 )
+if solar_export_credit_sar > 0:
+    billing["Final Bill"] = max(billing["Final Bill"] - solar_export_credit_sar, 0)
+    billing["Amount Saved"] += solar_export_credit_sar
+    billing["Discount"] += solar_export_credit_sar
+    billing["Status"] += f" | Solar grid export credit applied: {solar_export_credit_sar:.2f} SAR."
 
 selected_medical_device = (
     st.session_state.person_a_medical_device if selected_person == "Person A" else st.session_state.person_b_medical_device
@@ -4219,6 +4353,14 @@ condition_rows.append({
     "Status": "Satisfied" if selected_baseline <= (historical_baseline_a if selected_person == "Person A" else historical_baseline_b) else "Not satisfied"
 })
 
+condition_rows.append({
+    "Condition": "Hybrid solar DER support",
+    "Active": selected_solar_profile["Has Solar"],
+    "Rule": "Solar self-consumption reduces billable usage; surplus during peak stress earns export credit and can cover Last Resort support if sufficient",
+    "Result": f"Self-use {solar_self_consumption_kwh:.2f} kWh | Export {solar_export_kwh:.2f} kWh | Peak support {selected_solar_profile['Peak Available Solar kW']:.2f} kW",
+    "Status": "Satisfied" if (solar_self_consumption_kwh > 0 or solar_export_credit_sar > 0 or solar_last_resort_support_active) else "No solar support"
+})
+
 condition_df = pd.DataFrame(condition_rows)
 st.dataframe(style_status_cells(condition_df), use_container_width=True)
 
@@ -4234,6 +4376,12 @@ billing_df = pd.DataFrame([{
     "Client": selected_person,
     "Baseline kWh": selected_baseline,
     "Requested Usage kWh": requested_usage,
+    "Final Usage Before Solar kWh": final_usage_before_solar,
+    "Solar Self-Consumption kWh": solar_self_consumption_kwh,
+    "Solar Export kWh": solar_export_kwh,
+    "Solar Export Credit SAR": solar_export_credit_sar,
+    "Peak Solar Support kW": selected_solar_profile["Peak Available Solar kW"],
+    "Solar Last Resort Support Active": solar_last_resort_support_active,
     "Final Usage kWh": final_usage,
     "Normal Usage kWh": billing["Normal Usage kWh"],
     "Premium Usage kWh": billing["Premium Usage kWh"],
