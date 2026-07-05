@@ -2084,93 +2084,309 @@ def render_ac_plan_overlay(image_path, ac_states, positions, show_added_labels=F
 
 
 # =========================================================
-# SCADA PDF REPORT GENERATOR - PIL ONLY, NO REPORTLAB REQUIRED
+# SCADA PDF REPORT GENERATOR - DYNAMIC SCENARIO REPORT
 # =========================================================
-def create_scada_pdf_report(report_path="SCADA_FULL_REPORT.pdf"):
-    """Generate a simple PDF using Pillow only so Streamlit Cloud does not need reportlab."""
-    page_w, page_h = 1240, 1754
-    margin = 70
+def create_scada_pdf_report(report_path="SCADA_FULL_REPORT.pdf", report_data=None):
+    """
+    Dynamic scenario PDF report using Pillow only.
+    - Body font: 14
+    - Section title font: 16
+    - Includes scenario-specific tables and generated graphs.
+    - Uses the latest SCADA scenario saved in st.session_state.latest_scada_report_data.
+    """
+    report_data = report_data or st.session_state.get("latest_scada_report_data", {})
+
+    # A4 portrait at roughly screen resolution. Font sizes match requested 14 / 16.
+    page_w, page_h = 842, 1191
+    margin = 42
     pages = []
     img = Image.new("RGB", (page_w, page_h), "white")
     draw = ImageDraw.Draw(img)
     y = margin
+
     try:
-        font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 40)
-        font_h = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
-        font_b = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 21)
-        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
+        font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
+        font_h = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
+        font_b = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
+        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 11)
+        font_tiny = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 9)
     except Exception:
-        font_title = ImageFont.load_default(); font_h = ImageFont.load_default(); font_b = ImageFont.load_default(); font_small = ImageFont.load_default()
+        font_title = ImageFont.load_default(); font_h = ImageFont.load_default(); font_b = ImageFont.load_default(); font_small = ImageFont.load_default(); font_tiny = ImageFont.load_default()
+
+    def clean(v):
+        if isinstance(v, (float, int, np.floating, np.integer)):
+            try:
+                return f"{float(v):,.2f}"
+            except Exception:
+                return str(v)
+        if isinstance(v, bool):
+            return "Yes" if v else "No"
+        return str(v)
+
     def new_page():
         nonlocal img, draw, y
         pages.append(img)
         img = Image.new("RGB", (page_w, page_h), "white")
         draw = ImageDraw.Draw(img)
         y = margin
+
+    def text_width(text, font):
+        try:
+            b = draw.textbbox((0, 0), str(text), font=font)
+            return b[2] - b[0]
+        except Exception:
+            return len(str(text)) * 7
+
     def wrap(text, font, width):
-        out=[]
+        lines = []
         for para in str(text).split("\n"):
-            words=para.split()
+            words = para.split()
             if not words:
-                out.append(""); continue
-            line=words[0]
-            for w in words[1:]:
-                test=line+" "+w
-                try: tw=draw.textbbox((0,0), test, font=font)[2]
-                except Exception: tw=len(test)*10
-                if tw <= width: line=test
-                else: out.append(line); line=w
-            out.append(line)
-        return out
-    def ensure(lines=4):
+                lines.append("")
+                continue
+            line = words[0]
+            for word in words[1:]:
+                candidate = line + " " + word
+                if text_width(candidate, font) <= width:
+                    line = candidate
+                else:
+                    lines.append(line)
+                    line = word
+            lines.append(line)
+        return lines
+
+    def ensure(height):
         nonlocal y
-        if y + lines*32 + 80 > page_h - margin:
+        if y + height > page_h - margin:
             new_page()
-    def text(t, font=None, color="black", gap=30):
+
+    def add_title(t):
         nonlocal y
-        font = font or font_b
-        lines=wrap(t, font, page_w-2*margin)
-        ensure(len(lines))
+        ensure(70)
+        draw.text((margin, y), str(t), fill="navy", font=font_title)
+        y += 34
+        draw.line((margin, y, page_w - margin, y), fill="navy", width=2)
+        y += 18
+
+    def add_h(t):
+        nonlocal y
+        ensure(42)
+        draw.text((margin, y), str(t), fill="darkblue", font=font_h)
+        y += 26
+
+    def add_p(t):
+        nonlocal y
+        lines = wrap(t, font_b, page_w - 2 * margin)
+        ensure(len(lines) * 19 + 12)
         for line in lines:
-            draw.text((margin,y), line, fill=color, font=font); y += gap
-        y += 12
-    def title(t):
+            draw.text((margin, y), line, fill="black", font=font_b)
+            y += 19
+        y += 8
+
+    def df_to_rows(df, max_rows=12, max_cols=5):
+        if df is None:
+            return []
+        if not isinstance(df, pd.DataFrame):
+            try:
+                df = pd.DataFrame(df)
+            except Exception:
+                return []
+        if df.empty:
+            return []
+        d = df.copy()
+        if len(d.columns) > max_cols:
+            d = d.iloc[:, :max_cols]
+        if len(d) > max_rows:
+            d = d.head(max_rows)
+        rows = [[str(c) for c in d.columns]]
+        for _, row in d.iterrows():
+            rows.append([clean(row[c]) for c in d.columns])
+        return rows
+
+    def add_table(title, df_or_rows, max_rows=12, max_cols=5):
         nonlocal y
-        ensure(5); draw.text((margin,y), t, fill="navy", font=font_title); y += 60; draw.line((margin,y,page_w-margin,y), fill="navy", width=3); y += 35
-    def heading(t):
-        nonlocal y
-        ensure(3); draw.text((margin,y), t, fill="darkblue", font=font_h); y += 45
-    def table(rows):
-        nonlocal y
-        row_h=48; ensure(len(rows)+2)
-        for i,row in enumerate(rows):
-            fill=(220,235,255) if i==0 else (250,250,250)
-            draw.rectangle((margin,y,page_w-margin,y+row_h), fill=fill, outline="gray")
-            draw.line((margin+390,y,margin+390,y+row_h), fill="gray")
-            f=font_small if i else font_b
-            draw.text((margin+10,y+12), str(row[0])[:38], fill="black", font=f)
-            draw.text((margin+410,y+12), str(row[1])[:72], fill="black", font=f)
+        rows = df_to_rows(df_or_rows, max_rows=max_rows, max_cols=max_cols) if isinstance(df_or_rows, pd.DataFrame) else df_or_rows
+        if not rows:
+            return
+        add_h(title)
+        table_w = page_w - 2 * margin
+        col_count = max(len(rows[0]), 1)
+        col_w = table_w / col_count
+        row_h = 26
+        table_h = row_h * len(rows) + 10
+        ensure(table_h)
+        for r, row in enumerate(rows):
+            fill = (222, 235, 255) if r == 0 else ((248, 248, 248) if r % 2 else (255, 255, 255))
+            draw.rectangle((margin, y, page_w - margin, y + row_h), outline="gray", fill=fill)
+            for c in range(col_count):
+                x = margin + c * col_w
+                draw.line((x, y, x, y + row_h), fill="gray")
+                val = str(row[c]) if c < len(row) else ""
+                # Trim visually so table does not overflow.
+                while text_width(val, font_tiny) > col_w - 6 and len(val) > 3:
+                    val = val[:-4] + "..."
+                draw.text((x + 3, y + 8), val, fill="black", font=font_tiny if r else font_small)
+            draw.line((page_w - margin, y, page_w - margin, y + row_h), fill="gray")
             y += row_h
-        y += 20
-    title("SCADA Dynamic Pricing, Smart Meter, Solar DER and Predictive Maintenance Report")
-    heading("Index")
-    text("1. Abstract\n2. Introduction\n3. Saudi Tariff and Monthly-vs-Daily Baseline Model\n4. Smart Meter and Fairness Conditions\n5. Solar DER and Net Support\n6. Crisis Simulation\n7. Predictive Maintenance\n8. Tables, Graph Choices and Design Explanation\n9. Conclusion")
-    ensure(10)
-    x0,y0=margin,y
-    boxes=[(x0,y0,x0+230,y0+90,"Smart Meter"),(x0+300,y0,x0+530,y0+90,"SCADA Logic"),(x0+600,y0,x0+830,y0+90,"Billing / Tariff"),(x0+900,y0,x0+1070,y0+90,"Grid Stability"),(x0+300,y0+170,x0+530,y0+260,"Solar DER"),(x0+600,y0+170,x0+900,y0+260,"Predictive Maintenance")]
-    for bx1,by1,bx2,by2,label in boxes:
-        draw.rectangle((bx1,by1,bx2,by2), outline="navy", width=3, fill=(230,240,255)); draw.text((bx1+15,by1+30), label, fill="black", font=font_small)
-    y += 310
-    new_page()
-    heading("Abstract"); text("This report documents the SCADA simulation logic, including Saudi monthly tariff rules, daily peak-event baseline conversion, smart meter load shedding, premium versus penalty separation, solar DER support, crisis simulation, and predictive maintenance.")
-    heading("Introduction"); text("The system converts monthly approved baselines into daily peak-event limits so daily scenarios are realistic. The simulator supports autonomy, Last Resort fair settlement, medical-device charity support, company growth discounts, solar self-consumption, and solar export credit.")
-    heading("Saudi Tariff and Baseline Model"); text("Residential billing is monthly: 0.18 SAR/kWh up to 6,000 kWh/month and 0.30 SAR/kWh above 6,000 kWh/month. Commercial billing is monthly: 0.22 SAR/kWh up to 6,000 kWh/month and 0.32 SAR/kWh above 6,000 kWh/month. SCADA peak events use daily baseline = monthly approved baseline / 30.")
-    table([["Item","Value"],["Residential Tier 1","0.18 SAR/kWh up to 6,000 kWh/month"],["Residential Tier 2","0.30 SAR/kWh above 6,000 kWh/month"],["Commercial Tier 1","0.22 SAR/kWh up to 6,000 kWh/month"],["Commercial Tier 2","0.32 SAR/kWh above 6,000 kWh/month"],["Daily peak baseline","Company approved monthly baseline / 30"]])
-    heading("Smart Meter and Fairness Conditions"); text("The smart meter uses appliance quantity, kW per unit, connection status, preservation limits, and priority order. Premium and penalty are mutually exclusive: signed premium preservation means premium pricing; no premium agreement with above-baseline behavior means penalty behavior.")
-    heading("Solar DER and Net Support"); text("Solar DER reduces billable monthly consumption through self-consumption. Exported surplus during peak stress creates bill credit. Solar peak support can also reduce net grid-dependent daily peak usage and stop the timer if the home stays within the daily baseline.")
-    heading("Crisis Simulation"); text("The crisis model compares required grid support, load shed, solar support, maximum controllable shed, and final net grid load. The crisis is stable only when shed kW plus solar support reaches the required target.")
-    heading("Predictive Maintenance"); text("The maintenance page reports asset condition, RUL, risk, P point, F point, and a component maintenance-soon table for insulation, thermal system, vibration, breaker operations, and fault history.")
-    heading("Conclusion"); text("The final design separates monthly billing from daily peak control, supports solar DER customers fairly, and makes premium and penalty logic clear and non-overlapping.")
+        y += 14
+
+    def add_bar_chart(title, labels, values, unit="", color=(40, 115, 220)):
+        nonlocal y
+        labels = [str(x) for x in labels]
+        values = [float(v) if pd.notna(v) else 0.0 for v in values]
+        if not labels or not values:
+            return
+        add_h(title)
+        chart_h = 250
+        ensure(chart_h + 30)
+        x0, y0 = margin + 40, y + 10
+        x1, y1 = page_w - margin - 20, y + chart_h - 45
+        draw.rectangle((x0, y0, x1, y1), outline="black", width=1)
+        max_v = max(max(values), 1)
+        bar_area = x1 - x0 - 30
+        gap = 8
+        bar_w = max(10, (bar_area - gap * (len(values) - 1)) / max(len(values), 1))
+        for i, (lab, val) in enumerate(zip(labels, values)):
+            bx0 = x0 + 20 + i * (bar_w + gap)
+            bh = (val / max_v) * (y1 - y0 - 25)
+            by0 = y1 - bh
+            draw.rectangle((bx0, by0, bx0 + bar_w, y1), fill=color, outline="black")
+            draw.text((bx0, by0 - 14), f"{val:.1f}{unit}", fill="black", font=font_tiny)
+            short_lab = lab[:12] + ("..." if len(lab) > 12 else "")
+            draw.text((bx0, y1 + 5), short_lab, fill="black", font=font_tiny)
+        y += chart_h + 10
+
+    def add_group_bar_chart(title, df, label_col, series_cols):
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return
+        nonlocal y
+        add_h(title)
+        chart_h = 285
+        ensure(chart_h + 30)
+        x0, y0 = margin + 40, y + 10
+        x1, y1 = page_w - margin - 20, y + chart_h - 65
+        draw.rectangle((x0, y0, x1, y1), outline="black", width=1)
+        d = df.head(8).copy()
+        vals = []
+        for c in series_cols:
+            vals += [float(v) if pd.notna(v) else 0.0 for v in d[c].tolist()]
+        max_v = max(vals) if vals else 1
+        max_v = max(max_v, 1)
+        colors_list = [(46, 134, 193), (231, 76, 60), (39, 174, 96), (155, 89, 182)]
+        group_w = (x1 - x0 - 30) / max(len(d), 1)
+        bar_w = max(4, (group_w - 8) / max(len(series_cols), 1))
+        for i, (_, row) in enumerate(d.iterrows()):
+            gx = x0 + 15 + i * group_w
+            for j, c in enumerate(series_cols):
+                val = float(row.get(c, 0) or 0)
+                bh = (val / max_v) * (y1 - y0 - 25)
+                bx0 = gx + j * bar_w
+                draw.rectangle((bx0, y1 - bh, bx0 + bar_w, y1), fill=colors_list[j % len(colors_list)], outline="black")
+            lab = str(row.get(label_col, ""))[:10]
+            draw.text((gx, y1 + 5), lab, fill="black", font=font_tiny)
+        lx = x0
+        ly = y1 + 28
+        for j, c in enumerate(series_cols):
+            draw.rectangle((lx, ly, lx + 10, ly + 10), fill=colors_list[j % len(colors_list)], outline="black")
+            draw.text((lx + 14, ly - 1), c[:22], fill="black", font=font_tiny)
+            lx += 145
+        y += chart_h + 5
+
+    # Data extraction
+    scenario = report_data.get("scenario", {})
+    billing_df = report_data.get("billing_df")
+    condition_df = report_data.get("condition_df")
+    shed_df = report_data.get("shed_df")
+    settlement_df = report_data.get("settlement_df")
+    fraud_guard_df = report_data.get("fraud_guard_df")
+    appliance_df = report_data.get("appliance_df")
+    solar_df = report_data.get("solar_df")
+    notes = report_data.get("notes", [])
+
+    # Cover and index
+    add_title("SCADA Scenario Report")
+    add_p("Generated from the current Streamlit SCADA scenario. The content changes according to the selected client, peak/stress state, solar configuration, timer state, premium/penalty settings, smart-meter table, and crisis/last-resort conditions.")
+    add_table("Index", [
+        ["Section", "Content"],
+        ["1", "Abstract and scenario state"],
+        ["2", "Inputs and baseline/fraud guard"],
+        ["3", "Cost and tariff tables"],
+        ["4", "Peak/crisis/timer/last-resort decision logic"],
+        ["5", "Smart-meter shedding tables"],
+        ["6", "Scenario graphs"],
+        ["7", "Explanation and conclusion"],
+    ], max_rows=10, max_cols=2)
+
+    add_h("Abstract")
+    active_parts = []
+    for key in ["Grid Stress", "Peak Event", "Last Resort Active", "Timer Penalty Active", "Premium Agreement", "Refuse Disconnect", "Solar Enabled"]:
+        if str(scenario.get(key, False)) in ["True", "Yes", "Active"] or scenario.get(key) is True:
+            active_parts.append(key)
+    add_p("This report evaluates the active scenario. Active operational flags: " + (", ".join(active_parts) if active_parts else "normal/no active emergency flags") + ". The report uses Saudi monthly tariff logic while converting monthly approved baselines into daily peak-event limits for SCADA decisions.")
+
+    add_table("Scenario Summary", [["Parameter", "Value"]] + [[k, clean(v)] for k, v in scenario.items()], max_rows=30, max_cols=2)
+
+    if fraud_guard_df is not None:
+        add_table("Historical Consumption Baselines + Company Fraud Guard", fraud_guard_df, max_rows=6, max_cols=6)
+        add_p("Interpretation: this table explains whether the historical baseline is acceptable compared with the property size, occupants, and declared devices. The daily peak baseline is derived from the monthly approved baseline divided by 30.")
+
+    if settlement_df is not None:
+        add_table("Daily Peak / Last Resort Settlement Table", settlement_df, max_rows=8, max_cols=6)
+
+    if billing_df is not None:
+        add_table("Cost and Billing Result Table", billing_df, max_rows=4, max_cols=8)
+        cost_cols = [c for c in ["Saudi Energy Charge SAR", "Saudi Meter Fee SAR", "Premium Charge SAR", "Penalty SAR", "Timer Penalty SAR", "Solar Export Credit SAR", "Discount SAR", "Medical Charity Discount SAR", "Final Bill SAR"] if c in billing_df.columns]
+        if cost_cols:
+            add_bar_chart("Cost Components Graph", cost_cols, [float(billing_df.iloc[0].get(c, 0) or 0) for c in cost_cols], unit=" SAR", color=(41, 128, 185))
+        usage_cols = [c for c in ["Monthly Approved Baseline kWh", "Daily Peak Baseline kWh", "Daily Requested Peak Usage kWh", "Daily Net Grid Usage After Solar kWh", "Projected Monthly Billing Usage After Solar kWh", "Solar Self-Consumption kWh", "Solar Export kWh"] if c in billing_df.columns]
+        if usage_cols:
+            add_bar_chart("Usage and Solar Energy Graph", usage_cols, [float(billing_df.iloc[0].get(c, 0) or 0) for c in usage_cols], unit=" kWh", color=(39, 174, 96))
+
+    if condition_df is not None:
+        add_table("Fairness and Protection Condition Evaluation", condition_df, max_rows=18, max_cols=5)
+
+    if solar_df is not None:
+        add_table("Solar DER Scenario Table", solar_df, max_rows=8, max_cols=6)
+
+    if appliance_df is not None:
+        add_table("Actual Appliance Data Used By Smart Meter", appliance_df, max_rows=12, max_cols=8)
+
+    if shed_df is not None:
+        add_table("Load Shedding Result Table", shed_df, max_rows=12, max_cols=8)
+        if all(c in shed_df.columns for c in ["Appliance", "Connected Load kW", "Shed kW", "Remaining Load kW"]):
+            add_group_bar_chart("Original vs Shed vs Remaining Load Graph", shed_df, "Appliance", ["Connected Load kW", "Shed kW", "Remaining Load kW"])
+        if all(c in shed_df.columns for c in ["Appliance", "Quantity", "Disconnected Units", "Remaining Units"]):
+            add_group_bar_chart("Unit Disconnection Graph", shed_df, "Appliance", ["Quantity", "Disconnected Units", "Remaining Units"])
+
+    crisis_df = report_data.get("crisis_df")
+    if crisis_df is not None:
+        add_table("Crisis Simulation Summary", crisis_df, max_rows=14, max_cols=4)
+        if "Metric" in crisis_df.columns and "Value" in crisis_df.columns:
+            numeric = crisis_df[pd.to_numeric(crisis_df["Value"], errors="coerce").notna()].copy()
+            if len(numeric) > 0:
+                add_bar_chart("Crisis Feasibility Graph", numeric["Metric"].astype(str).tolist(), pd.to_numeric(numeric["Value"], errors="coerce").fillna(0).tolist(), unit="", color=(211, 84, 0))
+
+    add_h("Explanation of Choices and Graphs")
+    explanation = [
+        "The cost graph compares Saudi energy charge, meter fee, premium charge, penalties, timer penalty, solar export credit, discounts, and the final bill when those values are present in the scenario.",
+        "The usage graph separates monthly baseline/billing values from daily peak-event values, preventing monthly kWh from being treated as a one-day grid stress demand.",
+        "The load graph compares connected kW, shed kW, and remaining kW for each appliance, making the smart meter decision auditable.",
+        "The unit graph shows how many physical appliance units were disconnected or preserved under the selected priority and protection rules.",
+        "The crisis graph is included only when crisis data exists; it compares required support, actual shed, solar support, and feasibility values.",
+    ]
+    for item in explanation + list(notes):
+        add_p("• " + str(item))
+
+    add_h("Conclusion")
+    if bool(scenario.get("Timer Penalty Active", False)):
+        add_p("The scenario ended with a timer penalty. The bill reflects deadline/ignored-request penalty logic because the timer was latched after expiry.")
+    elif bool(scenario.get("Last Resort Active", False)):
+        add_p("The scenario used Last Resort fair-settlement logic. The company intervention focuses on reducing only the above-baseline grid-dependent demand.")
+    elif bool(scenario.get("Peak Event", False)) or bool(scenario.get("Grid Stress", False)):
+        add_p("The scenario is a peak/stress case. The report shows whether the customer stayed within the daily baseline, used premium preservation, received penalties, or used solar support.")
+    else:
+        add_p("The scenario is a normal/non-stress case. Standard Saudi monthly tariff billing is the main cost driver.")
+
     pages.append(img)
     pages[0].save(report_path, save_all=True, append_images=pages[1:])
     return report_path
@@ -2228,7 +2444,7 @@ with st.sidebar:
 
     st.divider()
     st.header("SCADA Report")
-    st.caption("The PDF report button is also available on the AI & Model Details page.")
+    st.caption("Uses the latest saved SCADA scenario snapshot. For the most exact report, use the report button under Billing & Condition Results after setting the scenario.")
     if st.button("Generate PDF Report", key="sidebar_generate_pdf_report"):
         generated_report_path = create_scada_pdf_report()
         with open(generated_report_path, "rb") as report_file:
@@ -4597,6 +4813,73 @@ billing_df = pd.DataFrame([{
 }])
 
 st.dataframe(billing_df, use_container_width=True)
+
+# Save current scenario for the dynamic PDF report. The Sidebar and AI report buttons use this snapshot.
+try:
+    solar_report_df = pd.DataFrame([{
+        "Has Solar": selected_solar_profile["Has Solar"],
+        "Solar Capacity kW": selected_solar_profile["Solar Capacity kW"],
+        "Peak Solar Available kW": selected_solar_profile["Peak Available Solar kW"],
+        "Monthly Solar Generation kWh": selected_solar_profile["Monthly Solar Generation kWh"],
+        "Self Use Percent": selected_solar_profile["Self Use Percent"],
+        "Export Enabled": selected_solar_profile["Export Enabled"],
+        "Solar Peak Event Support kWh": solar_peak_event_support_kwh,
+        "Solar Export Credit SAR": solar_export_credit_sar,
+    }])
+    st.session_state.latest_scada_report_data = {
+        "scenario": {
+            "Client": selected_person,
+            "Grid Stress": grid_stress,
+            "Peak Event": peak_event,
+            "Company Growth Mode": new_company_growth_mode,
+            "Last Resort Active": last_resort_mode_active,
+            "Forced Fair Settlement Active": forced_fair_settlement_active,
+            "Timer Should Run": timer_should_run,
+            "Timer Penalty Active": deadline_penalty_active,
+            "Timer Status": timer_status,
+            "Refuse Disconnect": refuse_disconnect,
+            "Premium Agreement": premium_preservation_agreement,
+            "Policy Mode": policy_mode,
+            "Climate Mode": climate_mode,
+            "Requested Reduction %": voluntary_reduction_percent,
+            "Mandatory Reduction %": mandatory_reduction_percent,
+            "Achieved Reduction %": achieved_reduction_percent,
+            "Original Load kW": original_load_kw,
+            "Final Load kW": final_load_kw,
+            "Daily Baseline kWh": selected_baseline,
+            "Requested Daily Peak kWh": requested_usage,
+            "Net Grid Daily Peak After Solar kWh": net_requested_usage_for_baseline,
+            "Projected Monthly Billing Usage kWh": monthly_billing_usage_after_solar,
+            "Final Bill SAR": billing["Final Bill"],
+        },
+        "billing_df": billing_df.copy(),
+        "condition_df": condition_df.copy(),
+        "shed_df": shed_df.copy(),
+        "settlement_df": settlement_df.copy(),
+        "fraud_guard_df": fraud_guard_df.copy(),
+        "appliance_df": actual_config_view.copy() if "actual_config_view" in locals() else None,
+        "solar_df": solar_report_df,
+        "notes": [
+            forced_fair_settlement_reason,
+            enforcement_status,
+            billing["Status"],
+        ],
+    }
+except Exception as report_snapshot_error:
+    st.warning(f"Report snapshot could not be fully prepared: {report_snapshot_error}")
+
+with st.expander("Generate Current Scenario Full PDF Report", expanded=False):
+    st.write("This report uses the current scenario values, cost table, fairness conditions, solar data, smart-meter shedding table, and generated graphs.")
+    if st.button("Generate Current Scenario PDF Report", key="current_scenario_pdf_report"):
+        generated_report_path = create_scada_pdf_report(report_data=st.session_state.get("latest_scada_report_data", {}))
+        with open(generated_report_path, "rb") as report_file:
+            st.download_button(
+                label="Download Current Scenario SCADA Report.pdf",
+                data=report_file,
+                file_name="SCADA_CURRENT_SCENARIO_REPORT.pdf",
+                mime="application/pdf",
+                key="current_scenario_pdf_download"
+            )
 
 
 # =========================================================
