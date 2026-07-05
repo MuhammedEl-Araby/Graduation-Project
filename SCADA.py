@@ -3783,6 +3783,8 @@ for client_name, monthly_baseline_value, daily_baseline_value, requested_value i
     })
 
 settlement_df = pd.DataFrame(settlement_rows)
+if "Surplus Above Daily Baseline kWh" in settlement_df.columns and "Surplus Above Baseline kWh" not in settlement_df.columns:
+    settlement_df["Surplus Above Baseline kWh"] = settlement_df["Surplus Above Daily Baseline kWh"]
 
 # =========================================================
 # TIMER AND FORCE SETTLEMENT LOGIC
@@ -4591,19 +4593,22 @@ st.header("Fair Settlement Across Users")
 st.dataframe(settlement_df, use_container_width=True)
 
 if company_force_fair_settlement and grid_stress and peak_event:
+    surplus_column = "Surplus Above Daily Baseline kWh" if "Surplus Above Daily Baseline kWh" in settlement_df.columns else "Surplus Above Baseline kWh"
+    if surplus_column not in settlement_df.columns:
+        settlement_df[surplus_column] = 0.0
     high_load_clients = settlement_df[
-        settlement_df["Surplus Above Baseline kWh"] > 0
+        pd.to_numeric(settlement_df[surplus_column], errors="coerce").fillna(0) > 0
     ]["Client"].tolist()
 
     if len(high_load_clients) == 0:
-        st.success("No user is above their own baseline. No forced settlement is required.")
+        st.success("No user is above their own daily peak baseline. No forced settlement is required.")
     elif len(high_load_clients) == 1:
         st.warning(
-            f"Only {high_load_clients[0]} is above baseline. Forced settlement applies only to that user."
+            f"Only {high_load_clients[0]} is above the daily peak baseline. Forced settlement applies only to that user."
         )
     else:
         st.error(
-            "Both users are above baseline. Forced settlement applies fairly to both users according to their own surplus."
+            "Both users are above the daily peak baseline. Forced settlement applies fairly to both users according to their own surplus."
         )
 
 
