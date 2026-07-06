@@ -1721,13 +1721,13 @@ def billing_engine(
     premium_agreement_signed=True
 ):
     """
-    Billing logic clean separation:
-    - Premium = signed uninterrupted above-baseline service.
-    - Penalty = above-baseline usage without premium agreement.
-    - Timer Penalty = above-baseline usage without premium agreement after deadline expires.
-    - No penalty/timer penalty when customer is within baseline.
-    - No negative penalties.
-    - Grid support discount only when customer actually reduced load and no penalty/premium applies.
+    Clean billing model:
+    - Solar self-consumption must already be reflected in final_usage before this function is called.
+    - Penalty and timer penalty are now ONE bill item: Penalty.
+    - Penalty applies only when customer is above baseline without premium agreement.
+    - Deadline/timer expiry increases/identifies the same Penalty item; it is not a second charge column.
+    - Penalty waived is removed.
+    - Amount Saved is kept internally only as a comparison, but it is no longer shown as a bill component.
     """
     baseline = max(float(baseline), 0.0)
     requested_usage = max(float(requested_usage), 0.0)
@@ -1735,81 +1735,59 @@ def billing_engine(
     achieved_reduction_percent = max(float(achieved_reduction_percent), 0.0)
     mandatory_reduction_percent = max(float(mandatory_reduction_percent), 0.0)
 
-    premium_usage = max(final_usage - baseline, 0.0)
+    above_baseline_kwh = max(final_usage - baseline, 0.0)
     normal_usage = min(final_usage, baseline)
-    within_baseline = premium_usage <= 1e-9
+    within_baseline = above_baseline_kwh <= 1e-9
 
     final_tariff = calculate_saudi_tariff_breakdown(final_usage, category="Residential", include_vat=False)
     no_action_tariff = calculate_saudi_tariff_breakdown(requested_usage, category="Residential", include_vat=False)
     no_action_bill = max(no_action_tariff["Total Bill SAR"], 0.0)
-    bill = max(final_tariff["Total Bill SAR"], 0.0)
 
-    bonus = 0.0
-    penalty = 0.0
-    timer_penalty = 0.0
+    bill = max(final_tariff["Total Bill SAR"], 0.0)
     premium_charge = 0.0
+    penalty = 0.0
     grid_support_discount = 0.0
     loyalty_discount = 0.0
     good_behavior_discount = 0.0
-    penalty_waived = 0.0
     company_growth_discount = 0.0
+    bonus = 0.0
     status = []
 
     premium_service_active = bool(
-        grid_stress and premium_usage > 0 and refused_disconnect and premium_agreement_signed
+        grid_stress and above_baseline_kwh > 0 and refused_disconnect and premium_agreement_signed
     )
 
     if premium_service_active:
         if fair_conditions.get("marginal_premium", True):
-            premium_charge = max(premium_usage * (RESIDENTIAL_TIER2_RATE + 0.10), 0.0)
+            premium_charge = max(above_baseline_kwh * (RESIDENTIAL_TIER2_RATE + 0.10), 0.0)
             status.append("Premium service active: only above-baseline kWh is charged as premium.")
         else:
             premium_charge = max(final_usage * 0.30, 0.0)
             status.append("Premium service active: full preserved usage is charged as premium because marginal premium is OFF.")
         bill += premium_charge
-    elif grid_stress and premium_usage > 0 and not premium_agreement_signed:
-        status.append("Above-baseline grid usage has no premium agreement, so penalty/timer rules may apply.")
 
-    # Timer penalty has priority over normal penalty so the bill does not double-punish the same event.
-    if (
-        deadline_penalty_active
-        and grid_stress
-        and not forced_fair_settlement_active
-        and premium_usage > 0
-        and not premium_service_active
-        and not premium_agreement_signed
-    ):
-        timer_penalty = max(final_tariff["Energy Charge SAR"] * 0.25, 0.0)
-        bill += timer_penalty
-        status.append("Timer penalty applied: deadline expired while above baseline without premium agreement.")
-    else:
-        penalty_should_apply = bool(
-            grid_stress
-            and not forced_fair_settlement_active
-            and premium_usage > 0
-            and not premium_service_active
-            and not premium_agreement_signed
-        )
-        if penalty_should_apply:
+    elif grid_stress and above_baseline_kwh > 0 and not premium_agreement_signed:
+        if deadline_penalty_active and not forced_fair_settlement_active:
+            penalty = max(final_tariff["Energy Charge SAR"] * 0.25, 0.0)
+            status.append("Penalty applied: timer/deadline expired while above baseline without premium agreement.")
+        elif not forced_fair_settlement_active:
             if fair_conditions.get("progressive_penalty", True):
                 shortfall = max(mandatory_reduction_percent - achieved_reduction_percent, 0.0)
-                # Baseline violation still creates a minimum progressive penalty even if the reduction slider is zero.
                 if mandatory_reduction_percent <= 0:
                     shortfall_ratio = 1.0
                 else:
-                    shortfall_ratio = max(shortfall / max(mandatory_reduction_percent, 1.0), 0.0)
-                    if shortfall_ratio == 0 and premium_usage > 0:
-                        shortfall_ratio = 0.25
+                    shortfall_ratio = max(shortfall / max(mandatory_reduction_percent, 1.0), 0.25)
                 penalty = max(final_tariff["Energy Charge SAR"] * 0.20 * shortfall_ratio, 0.0)
-                status.append("Progressive penalty applied for above-baseline usage without premium agreement.")
+                status.append("Penalty applied for above-baseline usage without premium agreement.")
             else:
                 penalty = max(final_tariff["Energy Charge SAR"] * 0.20, 0.0)
                 status.append("Flat penalty applied for above-baseline usage without premium agreement.")
-            bill += penalty
+        bill += penalty
 
     if within_baseline:
-        status.append("Within daily/monthly baseline: no premium, no penalty, and no timer penalty.")
+        status.append("Within baseline: no premium and no penalty.")
 
+    # Actual bill discounts only. This does NOT include solar credit and does NOT include avoided-cost comparison.
     if (
         fair_conditions.get("grid_support_discount", True)
         and grid_stress
@@ -1818,7 +1796,6 @@ def billing_engine(
         and achieved_reduction_percent >= mandatory_reduction_percent
         and premium_charge <= 0
         and penalty <= 0
-        and timer_penalty <= 0
     ):
         grid_support_discount = max(bill * DISCOUNT_RATE, 0.0)
         bill -= grid_support_discount
@@ -1829,9 +1806,8 @@ def billing_engine(
         and fair_conditions.get("historical_baseline", True)
         and grid_stress
         and final_usage <= baseline
-        and penalty <= 0
-        and timer_penalty <= 0
         and premium_charge <= 0
+        and penalty <= 0
     ):
         loyalty_discount = max(bill * LOYALTY_DISCOUNT_RATE, 0.0)
         bill -= loyalty_discount
@@ -1841,9 +1817,8 @@ def billing_engine(
         good_behavior_discount_rate > 0
         and grid_stress
         and final_usage <= baseline
-        and penalty <= 0
-        and timer_penalty <= 0
         and premium_charge <= 0
+        and penalty <= 0
     ):
         good_behavior_discount = max(bill * good_behavior_discount_rate, 0.0)
         bill -= good_behavior_discount
@@ -1857,30 +1832,30 @@ def billing_engine(
 
     if refused_disconnect and grid_stress and not forced_fair_settlement_active and premium_service_active:
         status.append("Customer refused disconnection under a signed premium agreement; timer is disabled for this premium service.")
-    elif refused_disconnect and grid_stress and not forced_fair_settlement_active:
-        status.append("Customer refused disconnection without valid premium coverage; enforcement/penalty may apply if above baseline.")
+    elif refused_disconnect and grid_stress and not forced_fair_settlement_active and above_baseline_kwh > 0:
+        status.append("Customer refused disconnection without premium coverage; penalty applies if above baseline.")
 
     if forced_fair_settlement_active:
-        status.append("Last Resort fair settlement stabilized the line. Timer and delay penalty are disabled.")
+        status.append("Last Resort fair settlement stabilized the line. Timer/deadline does not add a separate penalty.")
 
     if not status:
         status.append("Normal Saudi tariff billing condition.")
 
     final_bill = max(bill, 0.0)
-    amount_saved = max(no_action_bill - final_bill, 0.0)
     total_discount = max(grid_support_discount + loyalty_discount + good_behavior_discount + company_growth_discount, 0.0)
+    avoided_cost_vs_no_action = max(no_action_bill - final_bill, 0.0)
 
     return {
         "Normal Usage kWh": normal_usage,
-        "Premium Usage kWh": premium_usage,
+        "Premium Usage kWh": above_baseline_kwh,
         "Saudi Energy Charge SAR": final_tariff["Energy Charge SAR"],
         "Saudi Meter Fee SAR": final_tariff["Meter Fee SAR"],
         "Saudi Tier 1 kWh": final_tariff["Tier 1 kWh"],
         "Saudi Tier 2 kWh": final_tariff["Tier 2 kWh"],
         "Premium Charge": max(premium_charge, 0.0),
         "Penalty": max(penalty, 0.0),
-        "Timer Penalty": max(timer_penalty, 0.0),
-        "Penalty Waived": max(penalty_waived, 0.0),
+        "Timer Penalty": 0.0,
+        "Penalty Waived": 0.0,
         "Bonus": max(bonus, 0.0),
         "Discount": total_discount,
         "Grid Support Discount": max(grid_support_discount, 0.0),
@@ -1888,7 +1863,7 @@ def billing_engine(
         "Good Behavior Discount": max(good_behavior_discount, 0.0),
         "Company Growth Discount": max(company_growth_discount, 0.0),
         "No Action Bill": max(no_action_bill, 0.0),
-        "Amount Saved": max(amount_saved, 0.0),
+        "Amount Saved": avoided_cost_vs_no_action,
         "Final Bill": final_bill,
         "Status": " | ".join(status)
     }
@@ -2366,7 +2341,7 @@ def create_scada_pdf_report(report_path="SCADA_FULL_REPORT.pdf", report_data=Non
 
     if billing_df is not None:
         add_table("Cost and Billing Result Table", billing_df, max_rows=4, max_cols=8)
-        cost_cols = [c for c in ["Saudi Energy Charge SAR", "Saudi Meter Fee SAR", "Premium Charge SAR", "Penalty SAR", "Timer Penalty SAR", "Solar Export Credit SAR", "Total Actual Discounts SAR", "Grid Support Discount SAR", "Medical Charity Discount SAR", "Final Bill SAR"] if c in billing_df.columns]
+        cost_cols = [c for c in ["Saudi Energy Charge SAR", "Saudi Meter Fee SAR", "Premium Charge SAR", "Penalty SAR", "Solar Export Credit SAR", "Total Actual Discounts SAR", "Grid Support Discount SAR", "Medical Charity Discount SAR", "Final Bill SAR"] if c in billing_df.columns]
         if cost_cols:
             add_bar_chart("Cost Components Graph", cost_cols, [float(billing_df.iloc[0].get(c, 0) or 0) for c in cost_cols], unit=" SAR", color=(41, 128, 185))
         usage_cols = [c for c in ["Monthly Approved Baseline kWh", "Daily Peak Baseline kWh", "Daily Requested Peak Usage kWh", "Daily Net Grid Usage After Solar kWh", "Projected Monthly Billing Usage After Solar kWh", "Solar Self-Consumption kWh", "Solar Export kWh"] if c in billing_df.columns]
@@ -2399,7 +2374,7 @@ def create_scada_pdf_report(report_path="SCADA_FULL_REPORT.pdf", report_data=Non
 
     add_h("Explanation of Choices and Graphs")
     explanation = [
-        "The cost graph compares Saudi energy charge, meter fee, premium charge, penalties, timer penalty, solar export credit, discounts, and the final bill when those values are present in the scenario.",
+        "The cost graph compares Saudi energy charge, meter fee, premium charge, penalties, timer penalty, solar export credit, actual discounts, solar export credit, and the final bill when those values are present in the scenario.",
         "The usage graph separates monthly baseline/billing values from daily peak-event values, preventing monthly kWh from being treated as a one-day grid stress demand.",
         "The load graph compares connected kW, shed kW, and remaining kW for each appliance, making the smart meter decision auditable.",
         "The unit graph shows how many physical appliance units were disconnected or preserved under the selected priority and protection rules.",
@@ -2409,8 +2384,8 @@ def create_scada_pdf_report(report_path="SCADA_FULL_REPORT.pdf", report_data=Non
         add_p("• " + str(item))
 
     add_h("Conclusion")
-    if bool(scenario.get("Timer Penalty Active", False)):
-        add_p("The scenario ended with a timer penalty. The bill reflects deadline/ignored-request penalty logic because the timer was latched after expiry.")
+    if bool(scenario.get("Deadline Penalty Trigger Active", False)):
+        add_p("The scenario ended with a deadline-triggered penalty. Penalty and timer penalty are unified into one Penalty amount.")
     elif bool(scenario.get("Last Resort Active", False)):
         add_p("The scenario used Last Resort fair-settlement logic. The company intervention focuses on reducing only the above-baseline grid-dependent demand.")
     elif bool(scenario.get("Peak Event", False)) or bool(scenario.get("Grid Stress", False)):
@@ -4282,9 +4257,10 @@ billing = billing_engine(
 )
 if solar_export_credit_sar > 0:
     billing["Final Bill"] = max(billing["Final Bill"] - solar_export_credit_sar, 0)
-    billing["Amount Saved"] += solar_export_credit_sar
-    billing["Discount"] += solar_export_credit_sar
-    billing["Status"] += f" | Solar grid export credit applied: {solar_export_credit_sar:.2f} SAR."
+    billing["Solar Export Credit"] = solar_export_credit_sar
+    billing["Status"] += f" | Solar export credit subtracted from bill: {solar_export_credit_sar:.2f} SAR."
+else:
+    billing["Solar Export Credit"] = 0.0
 
 selected_medical_device = (
     st.session_state.person_a_medical_device if selected_person == "Person A" else st.session_state.person_b_medical_device
@@ -4293,7 +4269,7 @@ medical_charity_discount = 0.0
 if selected_medical_device:
     medical_charity_discount = billing["Final Bill"] * CHARITY_MEDICAL_DEVICE_DISCOUNT_RATE
     billing["Final Bill"] = max(billing["Final Bill"] - medical_charity_discount, 0)
-    billing["Amount Saved"] += medical_charity_discount
+    billing["Discount"] += medical_charity_discount
     billing["Status"] += " | Medical life-support charity discount applied."
 
 inactive_fairness_count = sum(1 for key, value in fair_conditions.items() if key != "growth_bonus" and not value)
@@ -4877,7 +4853,7 @@ billing_df = pd.DataFrame([{
     "Final Usage Before Solar kWh": final_usage_before_solar,
     "Solar Self-Consumption kWh": solar_self_consumption_kwh,
     "Solar Export kWh": solar_export_kwh,
-    "Solar Export Credit SAR": solar_export_credit_sar,
+    "Solar Export Credit SAR": billing.get("Solar Export Credit", solar_export_credit_sar),
     "Peak Solar Support kW": selected_solar_profile["Peak Available Solar kW"],
     "Solar Last Resort Support Active": solar_last_resort_support_active,
     "Final Usage kWh": final_usage,
@@ -4889,8 +4865,6 @@ billing_df = pd.DataFrame([{
         "Saudi Tier 2 kWh": billing.get("Saudi Tier 2 kWh", 0),
         "Premium Charge SAR": billing["Premium Charge"],
     "Penalty SAR": billing["Penalty"],
-    "Timer Penalty SAR": billing["Timer Penalty"],
-    "Penalty Waived SAR": billing["Penalty Waived"],
     "Bonus SAR": billing["Bonus"],
     "Total Actual Discounts SAR": billing["Discount"],
     "Grid Support Discount SAR": billing.get("Grid Support Discount", 0),
@@ -4898,8 +4872,7 @@ billing_df = pd.DataFrame([{
     "Good Behavior Discount SAR": billing["Good Behavior Discount"],
     "Medical Charity Discount SAR": medical_charity_discount,
     "Fairness Config Adjustment SAR": fairness_config_adjustment,
-    "No Action Bill SAR": billing["No Action Bill"],
-    "Amount Saved SAR": billing["Amount Saved"],
+    "No Action Estimate SAR": billing["No Action Bill"],
     "Final Bill SAR": billing["Final Bill"],
     "Condition Status": billing["Status"]
 }])
@@ -4916,7 +4889,7 @@ try:
         "Self Use Percent": selected_solar_profile["Self Use Percent"],
         "Export Enabled": selected_solar_profile["Export Enabled"],
         "Solar Peak Event Support kWh": solar_peak_event_support_kwh,
-        "Solar Export Credit SAR": solar_export_credit_sar,
+        "Solar Export Credit SAR": billing.get("Solar Export Credit", solar_export_credit_sar),
     }])
     st.session_state.latest_scada_report_data = {
         "scenario": {
@@ -4927,7 +4900,7 @@ try:
             "Last Resort Active": last_resort_mode_active,
             "Forced Fair Settlement Active": forced_fair_settlement_active,
             "Timer Should Run": timer_should_run,
-            "Timer Penalty Active": deadline_penalty_active,
+            "Deadline Penalty Trigger Active": deadline_penalty_active,
             "Timer Status": timer_status,
             "Refuse Disconnect": refuse_disconnect,
             "Premium Agreement": premium_preservation_agreement,
@@ -5468,6 +5441,7 @@ if last_resort_mode_active:
 # =========================================================
 # FINAL SYSTEM SUMMARY
 # =========================================================
+
 st.divider()
 st.header("Final SCADA Decision Summary")
 
