@@ -211,6 +211,8 @@ PRIORITY_MAX = 10
 
 LOW_BASELINE_THRESHOLD_KWH = 2.0
 LOW_BASELINE_MAX_REDUCTION_PERCENT = 10
+GRID_SAFE_LOAD_LIMIT_PERCENT = 80.0
+DEFAULT_CRISIS_GRID_CAPACITY_KW = 25.0
 
 LOAD_CATEGORY_OPTIONS = [
     "Critical / Never Disconnect",
@@ -416,6 +418,24 @@ if "person_b_solar_export_enabled" not in st.session_state:
     st.session_state.person_b_solar_export_enabled = True
 if "premium_preservation_agreement" not in st.session_state:
     st.session_state.premium_preservation_agreement = True
+if "requested_usage_a_daily" not in st.session_state:
+    st.session_state.requested_usage_a_daily = None
+if "requested_usage_b_daily" not in st.session_state:
+    st.session_state.requested_usage_b_daily = None
+if "selected_person_scada" not in st.session_state:
+    st.session_state.selected_person_scada = "Person A"
+if "grid_stress_scada" not in st.session_state:
+    st.session_state.grid_stress_scada = True
+if "peak_event_scada" not in st.session_state:
+    st.session_state.peak_event_scada = True
+if "new_company_growth_mode_scada" not in st.session_state:
+    st.session_state.new_company_growth_mode_scada = False
+if "user_failed_to_respond_scada" not in st.session_state:
+    st.session_state.user_failed_to_respond_scada = False
+if "crisis_grid_capacity_kw" not in st.session_state:
+    st.session_state.crisis_grid_capacity_kw = DEFAULT_CRISIS_GRID_CAPACITY_KW
+if "crisis_execute_protection" not in st.session_state:
+    st.session_state.crisis_execute_protection = False
 
 # Stores the latest non-forced scenario so Last Resort can show a simple
 # BEFORE vs AFTER comparison at the end of the page.
@@ -1025,52 +1045,28 @@ def describe_household_pattern(lamps, acs, washing, heavy, occupants, size):
     return messages
 
 
-def household_input(title, default_lamps, default_acs, default_washing,
-                    default_heavy, default_occupants, default_size):
-
+def household_input(title, default_lamps, default_acs, default_washing, default_heavy, default_occupants, default_size):
+    """Persistent household input. Values remain when navigating between pages."""
     st.subheader(title)
+    key_prefix = "hh_" + title.lower().replace(" ", "_").replace(":", "").replace("/", "_").replace("-", "_")
+    defaults = {
+        f"{key_prefix}_lamps": default_lamps,
+        f"{key_prefix}_acs": default_acs,
+        f"{key_prefix}_washing": default_washing,
+        f"{key_prefix}_heavy": default_heavy,
+        f"{key_prefix}_occupants": default_occupants,
+        f"{key_prefix}_size": default_size,
+    }
+    for key, default in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = default
 
-    lamps = st.number_input(
-        f"{title} - Lamps",
-        min_value=0,
-        value=default_lamps,
-        step=1
-    )
-
-    acs = st.number_input(
-        f"{title} - ACs",
-        min_value=0,
-        value=default_acs,
-        step=1
-    )
-
-    washing = st.number_input(
-        f"{title} - Washing Machines",
-        min_value=0,
-        value=default_washing,
-        step=1
-    )
-
-    heavy = st.number_input(
-        f"{title} - Heavy Machines",
-        min_value=0,
-        value=default_heavy,
-        step=1
-    )
-
-    occupants = st.number_input(
-        f"{title} - Occupants",
-        min_value=0,
-        value=default_occupants,
-        step=1
-    )
-
-    size = st.number_input(
-        f"{title} - House Size m²",
-        min_value=1,
-        value=default_size,
-        step=1
-    )
+    lamps = st.number_input(f"{title} - Lamps", min_value=0, step=1, key=f"{key_prefix}_lamps")
+    acs = st.number_input(f"{title} - ACs", min_value=0, step=1, key=f"{key_prefix}_acs")
+    washing = st.number_input(f"{title} - Washing Machines", min_value=0, step=1, key=f"{key_prefix}_washing")
+    heavy = st.number_input(f"{title} - Heavy Machines", min_value=0, step=1, key=f"{key_prefix}_heavy")
+    occupants = st.number_input(f"{title} - Occupants", min_value=0, step=1, key=f"{key_prefix}_occupants")
+    size = st.number_input(f"{title} - House Size m²", min_value=1, step=1, key=f"{key_prefix}_size")
 
     for msg in describe_household_pattern(lamps, acs, washing, heavy, occupants, size):
         st.info(msg)
@@ -1081,9 +1077,8 @@ def household_input(title, default_lamps, default_acs, default_washing,
         "washing_machine": washing,
         "heavy_machines": heavy,
         "occupants": occupants,
-        "house_size": size
+        "house_size": size,
     }])
-
 
 # =========================================================
 # PRIORITY HELPERS
@@ -1725,120 +1720,155 @@ def billing_engine(
     good_behavior_discount_rate,
     premium_agreement_signed=True
 ):
-    premium_usage = max(final_usage - baseline, 0)
+    """
+    Billing logic clean separation:
+    - Premium = signed uninterrupted above-baseline service.
+    - Penalty = above-baseline usage without premium agreement.
+    - Timer Penalty = above-baseline usage without premium agreement after deadline expires.
+    - No penalty/timer penalty when customer is within baseline.
+    - No negative penalties.
+    - Grid support discount only when customer actually reduced load and no penalty/premium applies.
+    """
+    baseline = max(float(baseline), 0.0)
+    requested_usage = max(float(requested_usage), 0.0)
+    final_usage = max(float(final_usage), 0.0)
+    achieved_reduction_percent = max(float(achieved_reduction_percent), 0.0)
+    mandatory_reduction_percent = max(float(mandatory_reduction_percent), 0.0)
+
+    premium_usage = max(final_usage - baseline, 0.0)
     normal_usage = min(final_usage, baseline)
+    within_baseline = premium_usage <= 1e-9
 
     final_tariff = calculate_saudi_tariff_breakdown(final_usage, category="Residential", include_vat=False)
     no_action_tariff = calculate_saudi_tariff_breakdown(requested_usage, category="Residential", include_vat=False)
+    no_action_bill = max(no_action_tariff["Total Bill SAR"], 0.0)
+    bill = max(final_tariff["Total Bill SAR"], 0.0)
 
-    no_action_bill = no_action_tariff["Total Bill SAR"]
-    bill = final_tariff["Total Bill SAR"]
-
-    bonus = 0
-    penalty = 0
-    timer_penalty = 0
-    premium_charge = 0
-    discount = 0
-    loyalty_discount = 0
-    good_behavior_discount = 0
-    penalty_waived = 0
-    company_growth_discount = 0
+    bonus = 0.0
+    penalty = 0.0
+    timer_penalty = 0.0
+    premium_charge = 0.0
+    grid_support_discount = 0.0
+    loyalty_discount = 0.0
+    good_behavior_discount = 0.0
+    penalty_waived = 0.0
+    company_growth_discount = 0.0
     status = []
 
-    if grid_stress and premium_usage > 0:
-        if refused_disconnect and premium_agreement_signed:
-            if fair_conditions["marginal_premium"]:
-                premium_charge = premium_usage * (RESIDENTIAL_TIER2_RATE + 0.10)
-                status.append("Premium preservation agreement active: premium pricing applied only to above-baseline usage.")
-            else:
-                premium_charge = final_usage * 0.30
-                status.append("Premium preservation agreement active: general premium pricing applied because marginal baseline protection is disabled.")
-            bill += premium_charge
-        else:
-            status.append("Above-baseline usage has no premium preservation agreement, so penalty logic is used instead of premium pricing.")
-
-    penalty_should_apply = (
-        grid_stress
-        and not forced_fair_settlement_active
-        and premium_charge <= 0
-        and (
-            (mandatory_reduction_percent > 0 and achieved_reduction_percent < mandatory_reduction_percent)
-            or (premium_usage > 0 and not premium_agreement_signed)
-        )
+    premium_service_active = bool(
+        grid_stress and premium_usage > 0 and refused_disconnect and premium_agreement_signed
     )
 
-    if (
-        penalty_should_apply
-        and fair_conditions["low_baseline_protection"]
-        and baseline <= LOW_BASELINE_THRESHOLD_KWH
-        and final_usage <= baseline
-    ):
-        penalty_waived = final_usage * 0.20
-        penalty_should_apply = False
-        status.append("Penalty waived by low-baseline protection because the customer stayed within normal usage.")
-
-    if penalty_should_apply:
-        if fair_conditions["progressive_penalty"]:
-            shortfall = mandatory_reduction_percent - achieved_reduction_percent
-            shortfall_ratio = shortfall / max(mandatory_reduction_percent, 1)
-            penalty = final_tariff["Energy Charge SAR"] * 0.20 * shortfall_ratio
-            status.append("Progressive penalty applied based on reduction shortfall.")
+    if premium_service_active:
+        if fair_conditions.get("marginal_premium", True):
+            premium_charge = max(premium_usage * (RESIDENTIAL_TIER2_RATE + 0.10), 0.0)
+            status.append("Premium service active: only above-baseline kWh is charged as premium.")
         else:
-            penalty = final_tariff["Energy Charge SAR"] * 0.20
-            status.append("Flat grid stress penalty applied because mandatory reduction was not achieved.")
-        bill += penalty
+            premium_charge = max(final_usage * 0.30, 0.0)
+            status.append("Premium service active: full preserved usage is charged as premium because marginal premium is OFF.")
+        bill += premium_charge
+    elif grid_stress and premium_usage > 0 and not premium_agreement_signed:
+        status.append("Above-baseline grid usage has no premium agreement, so penalty/timer rules may apply.")
 
-    if deadline_penalty_active and not forced_fair_settlement_active:
-        timer_penalty = final_tariff["Energy Charge SAR"] * 0.25
+    # Timer penalty has priority over normal penalty so the bill does not double-punish the same event.
+    if (
+        deadline_penalty_active
+        and grid_stress
+        and not forced_fair_settlement_active
+        and premium_usage > 0
+        and not premium_service_active
+        and not premium_agreement_signed
+    ):
+        timer_penalty = max(final_tariff["Energy Charge SAR"] * 0.25, 0.0)
         bill += timer_penalty
-        status.append("Deadline/ignored-request penalty applied because the user delayed or ignored company requests during stress.")
+        status.append("Timer penalty applied: deadline expired while above baseline without premium agreement.")
+    else:
+        penalty_should_apply = bool(
+            grid_stress
+            and not forced_fair_settlement_active
+            and premium_usage > 0
+            and not premium_service_active
+            and not premium_agreement_signed
+        )
+        if penalty_should_apply:
+            if fair_conditions.get("progressive_penalty", True):
+                shortfall = max(mandatory_reduction_percent - achieved_reduction_percent, 0.0)
+                # Baseline violation still creates a minimum progressive penalty even if the reduction slider is zero.
+                if mandatory_reduction_percent <= 0:
+                    shortfall_ratio = 1.0
+                else:
+                    shortfall_ratio = max(shortfall / max(mandatory_reduction_percent, 1.0), 0.0)
+                    if shortfall_ratio == 0 and premium_usage > 0:
+                        shortfall_ratio = 0.25
+                penalty = max(final_tariff["Energy Charge SAR"] * 0.20 * shortfall_ratio, 0.0)
+                status.append("Progressive penalty applied for above-baseline usage without premium agreement.")
+            else:
+                penalty = max(final_tariff["Energy Charge SAR"] * 0.20, 0.0)
+                status.append("Flat penalty applied for above-baseline usage without premium agreement.")
+            bill += penalty
+
+    if within_baseline:
+        status.append("Within daily/monthly baseline: no premium, no penalty, and no timer penalty.")
 
     if (
-        fair_conditions["grid_support_discount"]
+        fair_conditions.get("grid_support_discount", True)
         and grid_stress
         and mandatory_reduction_percent > 0
+        and achieved_reduction_percent > 0
         and achieved_reduction_percent >= mandatory_reduction_percent
+        and premium_charge <= 0
+        and penalty <= 0
+        and timer_penalty <= 0
     ):
-        discount_value = bill * DISCOUNT_RATE
-        bill -= discount_value
-        discount += discount_value
-        status.append("Grid support discount applied because mandatory reduction was achieved.")
+        grid_support_discount = max(bill * DISCOUNT_RATE, 0.0)
+        bill -= grid_support_discount
+        status.append("Grid support discount applied because load reduction met the mandatory target.")
 
     if (
-        fair_conditions["loyalty_discount"]
-        and fair_conditions["historical_baseline"]
+        fair_conditions.get("loyalty_discount", True)
+        and fair_conditions.get("historical_baseline", True)
         and grid_stress
         and final_usage <= baseline
+        and penalty <= 0
+        and timer_penalty <= 0
+        and premium_charge <= 0
     ):
-        loyalty_discount = bill * LOYALTY_DISCOUNT_RATE
+        loyalty_discount = max(bill * LOYALTY_DISCOUNT_RATE, 0.0)
         bill -= loyalty_discount
-        discount += loyalty_discount
-        status.append("Loyalty discount applied because usage stayed at or below the company-approved baseline during peak stress.")
+        status.append("Loyalty discount applied because usage stayed within the approved baseline during stress.")
 
-    if good_behavior_discount_rate > 0 and grid_stress and final_usage <= baseline:
-        good_behavior_discount = bill * good_behavior_discount_rate
+    if (
+        good_behavior_discount_rate > 0
+        and grid_stress
+        and final_usage <= baseline
+        and penalty <= 0
+        and timer_penalty <= 0
+        and premium_charge <= 0
+    ):
+        good_behavior_discount = max(bill * good_behavior_discount_rate, 0.0)
         bill -= good_behavior_discount
         status.append(f"Repeated good-behavior discount applied: {good_behavior_discount_rate * 100:.0f}%.")
 
-    if fair_conditions["growth_bonus"] and new_company_growth_mode:
-        company_growth_discount = bill * COMPANY_GROWTH_DISCOUNT_RATE
+    if fair_conditions.get("growth_bonus", False) and new_company_growth_mode:
+        company_growth_discount = max(bill * COMPANY_GROWTH_DISCOUNT_RATE, 0.0)
         bill -= company_growth_discount
-        discount += company_growth_discount
         bonus += company_growth_discount
-        status.append("New company growth discount applied to the whole bill after charges and penalties.")
+        status.append("Company growth discount applied after charges.")
 
-    if refused_disconnect and grid_stress and not forced_fair_settlement_active:
-        if fair_conditions["customer_autonomy"]:
-            status.append("User used manual override. Timer, premium pricing, or emergency enforcement may apply.")
+    if refused_disconnect and grid_stress and not forced_fair_settlement_active and premium_service_active:
+        status.append("Customer refused disconnection under a signed premium agreement; timer is disabled for this premium service.")
+    elif refused_disconnect and grid_stress and not forced_fair_settlement_active:
+        status.append("Customer refused disconnection without valid premium coverage; enforcement/penalty may apply if above baseline.")
 
     if forced_fair_settlement_active:
-        status.append("Forced fair settlement stabilized the line. Timer and delay penalty are disabled.")
+        status.append("Last Resort fair settlement stabilized the line. Timer and delay penalty are disabled.")
 
     if not status:
         status.append("Normal Saudi tariff billing condition.")
 
-    final_bill = max(bill, 0)
-    amount_saved = max(no_action_bill - final_bill, 0)
+    final_bill = max(bill, 0.0)
+    amount_saved = max(no_action_bill - final_bill, 0.0)
+    total_discount = max(grid_support_discount + loyalty_discount + good_behavior_discount + company_growth_discount, 0.0)
 
     return {
         "Normal Usage kWh": normal_usage,
@@ -1847,17 +1877,18 @@ def billing_engine(
         "Saudi Meter Fee SAR": final_tariff["Meter Fee SAR"],
         "Saudi Tier 1 kWh": final_tariff["Tier 1 kWh"],
         "Saudi Tier 2 kWh": final_tariff["Tier 2 kWh"],
-        "Premium Charge": premium_charge,
-        "Penalty": penalty,
-        "Timer Penalty": timer_penalty,
-        "Penalty Waived": penalty_waived,
-        "Bonus": bonus,
-        "Discount": discount,
-        "Loyalty Discount": loyalty_discount,
-        "Good Behavior Discount": good_behavior_discount,
-        "Company Growth Discount": company_growth_discount,
-        "No Action Bill": no_action_bill,
-        "Amount Saved": amount_saved,
+        "Premium Charge": max(premium_charge, 0.0),
+        "Penalty": max(penalty, 0.0),
+        "Timer Penalty": max(timer_penalty, 0.0),
+        "Penalty Waived": max(penalty_waived, 0.0),
+        "Bonus": max(bonus, 0.0),
+        "Discount": total_discount,
+        "Grid Support Discount": max(grid_support_discount, 0.0),
+        "Loyalty Discount": max(loyalty_discount, 0.0),
+        "Good Behavior Discount": max(good_behavior_discount, 0.0),
+        "Company Growth Discount": max(company_growth_discount, 0.0),
+        "No Action Bill": max(no_action_bill, 0.0),
+        "Amount Saved": max(amount_saved, 0.0),
         "Final Bill": final_bill,
         "Status": " | ".join(status)
     }
@@ -2335,7 +2366,7 @@ def create_scada_pdf_report(report_path="SCADA_FULL_REPORT.pdf", report_data=Non
 
     if billing_df is not None:
         add_table("Cost and Billing Result Table", billing_df, max_rows=4, max_cols=8)
-        cost_cols = [c for c in ["Saudi Energy Charge SAR", "Saudi Meter Fee SAR", "Premium Charge SAR", "Penalty SAR", "Timer Penalty SAR", "Solar Export Credit SAR", "Discount SAR", "Medical Charity Discount SAR", "Final Bill SAR"] if c in billing_df.columns]
+        cost_cols = [c for c in ["Saudi Energy Charge SAR", "Saudi Meter Fee SAR", "Premium Charge SAR", "Penalty SAR", "Timer Penalty SAR", "Solar Export Credit SAR", "Total Actual Discounts SAR", "Grid Support Discount SAR", "Medical Charity Discount SAR", "Final Bill SAR"] if c in billing_df.columns]
         if cost_cols:
             add_bar_chart("Cost Components Graph", cost_cols, [float(billing_df.iloc[0].get(c, 0) or 0) for c in cost_cols], unit=" SAR", color=(41, 128, 185))
         usage_cols = [c for c in ["Monthly Approved Baseline kWh", "Daily Peak Baseline kWh", "Daily Requested Peak Usage kWh", "Daily Net Grid Usage After Solar kWh", "Projected Monthly Billing Usage After Solar kWh", "Solar Self-Consumption kWh", "Solar Export kWh"] if c in billing_df.columns]
@@ -2559,11 +2590,13 @@ remaining useful life, and graph shape. The feature-impact graph is dynamic for 
     left_col, right_col = st.columns([0.34, 0.66])
     with left_col:
         st.subheader("SCADA Case Study Inputs")
-        asset_type = st.selectbox(
+        asset_type = "Distribution Transformer"
+        st.selectbox(
             "Grid Asset Type",
-            ["Distribution Transformer", "Feeder Cable", "Circuit Breaker", "Switchgear", "Main Distribution Panel"],
+            ["Distribution Transformer"],
             index=0,
             key="mx_asset_type",
+            help="Transformer-only maintenance model for this graduation version."
         )
         asset_profile = get_grid_asset_profile(asset_type)
         use_live_load = st.checkbox("Use current Smart Meter connected load as grid load input", value=True, key="mx_use_live_load")
@@ -3092,13 +3125,26 @@ This page checks whether appliance shedding plus hybrid solar grid support can s
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        crisis_reduction = st.slider("Crisis Reduction Target (%)", min_value=0, max_value=95, value=35, step=1)
+        crisis_reduction = st.slider("Extra Crisis Reduction Target (%)", min_value=0, max_value=95, value=35, step=1)
     with c2:
         crisis_policy = st.selectbox("Crisis Priority Mode", ["Manual User Priority", "Company Priority"], index=1)
     with c3:
-        force_crisis = st.checkbox("Execute crisis shedding now", value=True)
+        force_crisis = st.checkbox("Execute crisis protection shedding now", key="crisis_execute_protection")
     with c4:
         min_service = st.checkbox("Minimum service preservation", value=True)
+
+    cap1, cap2 = st.columns(2)
+    with cap1:
+        crisis_grid_capacity_kw = st.number_input(
+            "Temporary Grid Capacity Limit kW",
+            min_value=1.0,
+            value=float(st.session_state.crisis_grid_capacity_kw),
+            step=1.0,
+            key="crisis_grid_capacity_kw",
+            help="Protection starts when load exceeds 80% of this temporary grid capacity."
+        )
+    with cap2:
+        st.metric("Built-in Protection Threshold", f"{GRID_SAFE_LOAD_LIMIT_PERCENT:.0f}% of capacity")
 
     st.subheader("Hybrid Solar Crisis Support")
     sc1, sc2, sc3, sc4 = st.columns(4)
@@ -3156,7 +3202,18 @@ This page checks whether appliance shedding plus hybrid solar grid support can s
 
     crisis_load_df = calculate_current_connected_load(crisis_input_df)
     crisis_original_kw = float(crisis_load_df["Connected Load kW"].sum())
-    crisis_required_shed_kw = crisis_original_kw * crisis_reduction / 100 if crisis_original_kw > 0 else 0
+    crisis_user_target_shed_kw = crisis_original_kw * crisis_reduction / 100 if crisis_original_kw > 0 else 0
+    crisis_safe_limit_kw = crisis_grid_capacity_kw * GRID_SAFE_LOAD_LIMIT_PERCENT / 100
+    crisis_overload_shed_kw = max(crisis_original_kw - crisis_safe_limit_kw, 0)
+    crisis_required_shed_kw = max(crisis_user_target_shed_kw, crisis_overload_shed_kw)
+    overload_crisis_active = crisis_overload_shed_kw > 0
+    if overload_crisis_active:
+        st.error(
+            f"Grid protection active: load {crisis_original_kw:.2f} kW exceeds 80% safe limit "
+            f"({crisis_safe_limit_kw:.2f} kW). Required protection support is at least {crisis_overload_shed_kw:.2f} kW."
+        )
+    else:
+        st.success(f"No automatic grid overload: load {crisis_original_kw:.2f} kW is within the 80% safe limit ({crisis_safe_limit_kw:.2f} kW).")
     crisis_solar_support_kw = 0.0
     if crisis_solar_enabled and crisis_solar_export_enabled:
         crisis_solar_support_kw = crisis_solar_capacity_kw * SOLAR_PERFORMANCE_RATIO * (crisis_solar_peak_factor / 100)
@@ -3217,7 +3274,7 @@ This page checks whether appliance shedding plus hybrid solar grid support can s
 
     tolerance_kw = 1e-6
     crisis_no_load = crisis_original_kw <= tolerance_kw
-    crisis_no_target = crisis_reduction <= 0
+    crisis_no_target = crisis_reduction <= 0 and not overload_crisis_active
     crisis_physically_possible = (crisis_max_controllable_shed_kw + crisis_solar_support_kw + tolerance_kw) >= crisis_required_shed_kw
     crisis_target_met = crisis_actual_grid_support_kw + tolerance_kw >= crisis_required_shed_kw
     crisis_stable = (not crisis_no_load) and (crisis_no_target or (crisis_physically_possible and crisis_target_met and (force_crisis or solar_sufficient_for_crisis)))
@@ -3258,6 +3315,10 @@ This page checks whether appliance shedding plus hybrid solar grid support can s
     st.subheader("Crisis Feasibility Summary")
     crisis_summary_df = pd.DataFrame([
         {"Metric": "Original Load kW", "Value": crisis_original_kw},
+        {"Metric": "Grid Capacity Limit kW", "Value": crisis_grid_capacity_kw},
+        {"Metric": "80% Safe Limit kW", "Value": crisis_safe_limit_kw},
+        {"Metric": "Overload Support Required kW", "Value": crisis_overload_shed_kw},
+        {"Metric": "User Target Support kW", "Value": crisis_user_target_shed_kw},
         {"Metric": "Required Grid Support kW", "Value": crisis_required_shed_kw},
         {"Metric": "Solar Support kW", "Value": crisis_solar_support_kw},
         {"Metric": "Effective Required Shed after Solar kW", "Value": crisis_effective_required_shed_kw},
@@ -3584,7 +3645,7 @@ st.session_state.mandatory_reduction_percent = mandatory_reduction_percent
 
 user_failed_to_respond = st.checkbox(
     "User ignored repeated company requests until deadline expired",
-    value=False
+    key="user_failed_to_respond_scada"
 )
 
 premium_preservation_agreement = st.checkbox(
@@ -3596,6 +3657,10 @@ premium_preservation_agreement = st.checkbox(
     )
 )
 st.session_state.premium_preservation_agreement = premium_preservation_agreement
+st.caption(
+    "Premium rules: checked premium agreement + 'I do not want to disconnect anything' + above daily baseline = premium service; no timer and no penalty. "
+    "If 'Premium only above own baseline' is checked, premium is charged only on surplus. If it is unchecked, premium is charged on the full preserved usage."
+)
 
 
 # =========================================================
@@ -3637,6 +3702,10 @@ baseline_a = company_baseline_a_info["Company Approved Baseline kWh"]
 baseline_b = company_baseline_b_info["Company Approved Baseline kWh"]
 baseline_a_daily = baseline_a / DAYS_PER_BILLING_MONTH
 baseline_b_daily = baseline_b / DAYS_PER_BILLING_MONTH
+if st.session_state.requested_usage_a_daily is None:
+    st.session_state.requested_usage_a_daily = float(baseline_a_daily)
+if st.session_state.requested_usage_b_daily is None:
+    st.session_state.requested_usage_b_daily = float(baseline_b_daily + 3)
 
 
 # =========================================================
@@ -3674,7 +3743,8 @@ st.header("Client Selection and Peak Usage")
 selected_person = st.radio(
     "Choose Client / Smart Meter for Detailed Smart Meter Result",
     ["Person A", "Person B"],
-    horizontal=True
+    horizontal=True,
+    key="selected_person_scada"
 )
 
 u1, u2 = st.columns(2)
@@ -3683,17 +3753,21 @@ with u1:
     requested_usage_a = st.number_input(
         "Person A Daily Peak Event Usage kWh",
         min_value=0.0,
-        value=float(baseline_a_daily),
-        step=0.1
+        value=float(st.session_state.requested_usage_a_daily),
+        step=0.1,
+        key="requested_usage_a_daily_widget"
     )
+    st.session_state.requested_usage_a_daily = requested_usage_a
 
 with u2:
     requested_usage_b = st.number_input(
         "Person B Daily Peak Event Usage kWh",
         min_value=0.0,
-        value=float(baseline_b_daily + 3),
-        step=0.1
+        value=float(st.session_state.requested_usage_b_daily),
+        step=0.1,
+        key="requested_usage_b_daily_widget"
     )
+    st.session_state.requested_usage_b_daily = requested_usage_b
 
 mda, mdb = st.columns(2)
 with mda:
@@ -3799,9 +3873,19 @@ stress_active = grid_stress and peak_event
 
 # Customer baseline relation for DAILY peak event.
 # Monthly approved baseline is converted to daily baseline. Solar peak support reduces grid-dependent peak usage.
+solar_peak_event_total_kwh = 0.0
+solar_peak_event_self_use_kwh = 0.0
+solar_peak_event_export_kwh = 0.0
 solar_peak_event_support_kwh = 0.0
 if selected_solar_profile["Has Solar"] and stress_active:
-    solar_peak_event_support_kwh = selected_solar_profile["Peak Available Solar kW"] * PEAK_EVENT_HOURS
+    solar_peak_event_total_kwh = selected_solar_profile["Peak Available Solar kW"] * PEAK_EVENT_HOURS
+    if selected_solar_profile["Export Enabled"]:
+        solar_peak_event_self_use_kwh = solar_peak_event_total_kwh * selected_solar_profile["Self Use Percent"] / 100
+        solar_peak_event_export_kwh = max(solar_peak_event_total_kwh - solar_peak_event_self_use_kwh, 0)
+    else:
+        solar_peak_event_self_use_kwh = solar_peak_event_total_kwh
+        solar_peak_event_export_kwh = 0.0
+    solar_peak_event_support_kwh = min(solar_peak_event_self_use_kwh, requested_usage)
 net_requested_usage_for_baseline = max(requested_usage - solar_peak_event_support_kwh, 0)
 selected_surplus = max(net_requested_usage_for_baseline - selected_baseline, 0)
 customer_above_baseline = net_requested_usage_for_baseline > selected_baseline
@@ -3825,10 +3909,12 @@ forced_fair_settlement_active = (
 # Timer starts whenever NET grid-dependent daily peak usage is above the daily approved baseline.
 # Solar can stop the timer only if solar reduces net grid-dependent usage to/below baseline.
 # Premium agreement changes billing treatment, but it does not hide the timer.
+premium_service_timer_exempt = bool(refuse_disconnect and premium_preservation_agreement and customer_above_baseline)
 timer_should_run = bool(
     stress_active
     and not last_resort_mode_active
     and customer_above_baseline
+    and not premium_service_timer_exempt
 )
 
 timer_signature = (
@@ -4159,8 +4245,8 @@ if selected_solar_profile["Has Solar"]:
     solar_self_consumption_kwh = min(monthly_projected_usage_before_solar, solar_self_consumption_potential)
     monthly_billing_usage_after_solar = max(monthly_projected_usage_before_solar - solar_self_consumption_kwh, 0)
     if selected_solar_profile["Export Enabled"] and stress_active:
-        solar_export_kwh = max(solar_monthly_generation_kwh - solar_self_consumption_kwh, 0)
-        solar_export_credit_sar = solar_export_kwh * selected_solar_profile["Export Credit Rate SAR/kWh"]
+        solar_export_kwh = max(solar_monthly_generation_kwh * (100 - selected_solar_profile["Self Use Percent"]) / 100, 0)
+        solar_export_credit_sar = max(solar_export_kwh * selected_solar_profile["Export Credit Rate SAR/kWh"], 0)
 final_usage = final_usage_before_solar
 
 good_behavior_discount_rate = min(
@@ -4617,8 +4703,8 @@ if company_force_fair_settlement and grid_stress and peak_event:
     both_results = []
 
     for client_name, baseline_value, requested_value, household_df in [
-        ("Person A", baseline_a, requested_usage_a, person_a),
-        ("Person B", baseline_b, requested_usage_b, person_b)
+        ("Person A", baseline_a_daily, requested_usage_a, person_a),
+        ("Person B", baseline_b_daily, requested_usage_b, person_b)
     ]:
         surplus_value = max(requested_value - baseline_value, 0)
         forced_percent_value = (surplus_value / max(requested_value, 0.001)) * 100 if surplus_value > 0 else 0
@@ -4666,7 +4752,7 @@ if company_force_fair_settlement and grid_stress and peak_event:
             y="Disconnected Units",
             color="Client",
             barmode="group",
-            title="Disconnected Units by Client Under Fair Settlement",
+            title="Disconnected Units by Client Under Fair Settlement (daily-baseline surplus)",
             text_auto=".0f"
         )
         fig_both.update_layout(template="plotly_dark", height=580)
@@ -4806,7 +4892,8 @@ billing_df = pd.DataFrame([{
     "Timer Penalty SAR": billing["Timer Penalty"],
     "Penalty Waived SAR": billing["Penalty Waived"],
     "Bonus SAR": billing["Bonus"],
-    "Discount SAR": billing["Discount"],
+    "Total Actual Discounts SAR": billing["Discount"],
+    "Grid Support Discount SAR": billing.get("Grid Support Discount", 0),
     "Loyalty Discount SAR": billing["Loyalty Discount"],
     "Good Behavior Discount SAR": billing["Good Behavior Discount"],
     "Medical Charity Discount SAR": medical_charity_discount,
@@ -5381,7 +5468,6 @@ if last_resort_mode_active:
 # =========================================================
 # FINAL SYSTEM SUMMARY
 # =========================================================
-
 st.divider()
 st.header("Final SCADA Decision Summary")
 
