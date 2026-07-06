@@ -1723,11 +1723,8 @@ def billing_engine(
     """
     Clean billing model:
     - Solar self-consumption must already be reflected in final_usage before this function is called.
-    - Penalty and timer penalty are now ONE bill item: Penalty.
     - Penalty applies only when customer is above baseline without premium agreement.
-    - Deadline/timer expiry increases/identifies the same Penalty item; it is not a second charge column.
-    - Penalty waived is removed.
-    - Amount Saved is kept internally only as a comparison, but it is no longer shown as a bill component.
+    - No Action Difference Internal is kept internally only as a comparison, but it is no longer shown as a bill component.
     """
     baseline = max(float(baseline), 0.0)
     requested_usage = max(float(requested_usage), 0.0)
@@ -1854,8 +1851,6 @@ def billing_engine(
         "Saudi Tier 2 kWh": final_tariff["Tier 2 kWh"],
         "Premium Charge": max(premium_charge, 0.0),
         "Penalty": max(penalty, 0.0),
-        "Timer Penalty": 0.0,
-        "Penalty Waived": 0.0,
         "Bonus": max(bonus, 0.0),
         "Discount": total_discount,
         "Grid Support Discount": max(grid_support_discount, 0.0),
@@ -1863,7 +1858,7 @@ def billing_engine(
         "Good Behavior Discount": max(good_behavior_discount, 0.0),
         "Company Growth Discount": max(company_growth_discount, 0.0),
         "No Action Bill": max(no_action_bill, 0.0),
-        "Amount Saved": avoided_cost_vs_no_action,
+        "No Action Difference Internal": avoided_cost_vs_no_action,
         "Final Bill": final_bill,
         "Status": " | ".join(status)
     }
@@ -2325,7 +2320,7 @@ def create_scada_pdf_report(report_path="SCADA_FULL_REPORT.pdf", report_data=Non
 
     add_h("Abstract")
     active_parts = []
-    for key in ["Grid Stress", "Peak Event", "Last Resort Active", "Timer Penalty Active", "Premium Agreement", "Refuse Disconnect", "Solar Enabled"]:
+    for key in ["Grid Stress", "Peak Event", "Last Resort Active", "Penalty Active", "Premium Agreement", "Refuse Disconnect", "Solar Enabled"]:
         if str(scenario.get(key, False)) in ["True", "Yes", "Active"] or scenario.get(key) is True:
             active_parts.append(key)
     add_p("This report evaluates the active scenario. Active operational flags: " + (", ".join(active_parts) if active_parts else "normal/no active emergency flags") + ". The report uses Saudi monthly tariff logic while converting monthly approved baselines into daily peak-event limits for SCADA decisions.")
@@ -2341,7 +2336,7 @@ def create_scada_pdf_report(report_path="SCADA_FULL_REPORT.pdf", report_data=Non
 
     if billing_df is not None:
         add_table("Cost and Billing Result Table", billing_df, max_rows=4, max_cols=8)
-        cost_cols = [c for c in ["Saudi Energy Charge SAR", "Saudi Meter Fee SAR", "Premium Charge SAR", "Penalty SAR", "Solar Export Credit SAR", "Total Actual Discounts SAR", "Grid Support Discount SAR", "Medical Charity Discount SAR", "Final Bill SAR"] if c in billing_df.columns]
+        cost_cols = [c for c in ["Saudi Energy Charge SAR", "Saudi Meter Fee SAR", "Premium Charge SAR", "Penalty SAR", "Solar Export Credit SAR", "Grid Support Discount SAR", "Loyalty Discount SAR", "Good Behavior Discount SAR", "Company Growth Discount SAR", "Medical Charity Discount SAR", "Final Bill SAR"] if c in billing_df.columns]
         if cost_cols:
             add_bar_chart("Cost Components Graph", cost_cols, [float(billing_df.iloc[0].get(c, 0) or 0) for c in cost_cols], unit=" SAR", color=(41, 128, 185))
         usage_cols = [c for c in ["Monthly Approved Baseline kWh", "Daily Peak Baseline kWh", "Daily Requested Peak Usage kWh", "Daily Net Grid Usage After Solar kWh", "Projected Monthly Billing Usage After Solar kWh", "Solar Self-Consumption kWh", "Solar Export kWh"] if c in billing_df.columns]
@@ -2374,7 +2369,7 @@ def create_scada_pdf_report(report_path="SCADA_FULL_REPORT.pdf", report_data=Non
 
     add_h("Explanation of Choices and Graphs")
     explanation = [
-        "The cost graph compares Saudi energy charge, meter fee, premium charge, penalties, timer penalty, solar export credit, actual discounts, solar export credit, and the final bill when those values are present in the scenario.",
+        "The cost graph compares Saudi energy charge, meter fee, premium charge, penalties, deadline penalty, solar export credit, explicit discount sources, solar export credit, and the final bill when those values are present in the scenario.",
         "The usage graph separates monthly baseline/billing values from daily peak-event values, preventing monthly kWh from being treated as a one-day grid stress demand.",
         "The load graph compares connected kW, shed kW, and remaining kW for each appliance, making the smart meter decision auditable.",
         "The unit graph shows how many physical appliance units were disconnected or preserved under the selected priority and protection rules.",
@@ -2385,7 +2380,7 @@ def create_scada_pdf_report(report_path="SCADA_FULL_REPORT.pdf", report_data=Non
 
     add_h("Conclusion")
     if bool(scenario.get("Deadline Penalty Trigger Active", False)):
-        add_p("The scenario ended with a deadline-triggered penalty. Penalty and timer penalty are unified into one Penalty amount.")
+        add_p("The scenario ended with a deadline-triggered penalty. Penalty and deadline penalty are unified into one Penalty amount.")
     elif bool(scenario.get("Last Resort Active", False)):
         add_p("The scenario used Last Resort fair-settlement logic. The company intervention focuses on reducing only the above-baseline grid-dependent demand.")
     elif bool(scenario.get("Peak Event", False)) or bool(scenario.get("Grid Stress", False)):
@@ -3962,7 +3957,7 @@ if timer_should_run and not deadline_penalty_active:
     with b_timer_2:
         st.caption(
             "No automatic refresh is used. The countdown can finish on screen without moving your scenario. "
-            "After it shows EXPIRED, press the check/apply button once to latch the timer penalty."
+            "After it shows EXPIRED, press the check/apply button once to latch the deadline penalty."
         )
 
 
@@ -4269,7 +4264,6 @@ medical_charity_discount = 0.0
 if selected_medical_device:
     medical_charity_discount = billing["Final Bill"] * CHARITY_MEDICAL_DEVICE_DISCOUNT_RATE
     billing["Final Bill"] = max(billing["Final Bill"] - medical_charity_discount, 0)
-    billing["Discount"] += medical_charity_discount
     billing["Status"] += " | Medical life-support charity discount applied."
 
 inactive_fairness_count = sum(1 for key, value in fair_conditions.items() if key != "growth_bonus" and not value)
@@ -4462,7 +4456,7 @@ if good_behavior_discount_rate > 0 and grid_stress and peak_event and final_usag
         billing["Final Bill"] = max(billing["Final Bill"] - additional_good_behavior_discount, 0)
         billing["Good Behavior Discount"] += additional_good_behavior_discount
         billing["Discount"] += additional_good_behavior_discount
-        billing["Amount Saved"] += additional_good_behavior_discount
+        billing["No Action Difference Internal"] += additional_good_behavior_discount
         billing["Status"] += " | Good behavior streak discount applied after tracker update."
 
 # =========================================================
@@ -4479,7 +4473,7 @@ s2.metric("Final Connected Load", f"{final_load_kw:.2f} kW")
 s3.metric("Achieved Reduction", f"{achieved_reduction_percent:.2f}%")
 s4.metric("Final Daily Peak Usage", f"{final_usage:.2f} kWh/day")
 s5.metric("Final Bill", f"{billing['Final Bill']:.2f} SAR")
-s6.metric("Amount Saved", f"{billing['Amount Saved']:.2f} SAR")
+s6.metric("No Action Difference Internal", f"{billing['No Action Difference Internal']:.2f} SAR")
 
 e1, e2 = st.columns(2)
 e1.metric("Effective Voluntary Reduction", f"{effective_voluntary_reduction_percent:.2f}%")
@@ -4502,12 +4496,12 @@ else:
     visible_timer_state = "Inactive"
 
 e4.metric("Timer Status", visible_timer_state)
-e5.metric("Timer Penalty", "Active" if (deadline_penalty_active or ignored_request_penalty_active) else "Inactive")
+e5.metric("Penalty", "Active" if (deadline_penalty_active or ignored_request_penalty_active) else "Inactive")
 
 if st.session_state.get("deadline_penalty_latched", False):
     st.error("Deadline expired. Timer penalty/enforcement is latched active.")
 
-    if st.button("Reset Timer Penalty / Start New Event"):
+    if st.button("Reset Penalty / Start New Event"):
         reset_deadline_timer(clear_penalty=True)
         st.rerun()
 
@@ -4866,10 +4860,10 @@ billing_df = pd.DataFrame([{
         "Premium Charge SAR": billing["Premium Charge"],
     "Penalty SAR": billing["Penalty"],
     "Bonus SAR": billing["Bonus"],
-    "Total Actual Discounts SAR": billing["Discount"],
     "Grid Support Discount SAR": billing.get("Grid Support Discount", 0),
     "Loyalty Discount SAR": billing["Loyalty Discount"],
     "Good Behavior Discount SAR": billing["Good Behavior Discount"],
+    "Company Growth Discount SAR": billing.get("Company Growth Discount", 0),
     "Medical Charity Discount SAR": medical_charity_discount,
     "Fairness Config Adjustment SAR": fairness_config_adjustment,
     "No Action Estimate SAR": billing["No Action Bill"],
@@ -4878,6 +4872,28 @@ billing_df = pd.DataFrame([{
 }])
 
 st.dataframe(billing_df, use_container_width=True)
+
+st.subheader("Final Bill Source Breakdown")
+bill_formula_df = pd.DataFrame([
+    {"Bill Source": "Base Saudi tariff after solar self-use", "Type": "Charge", "Amount SAR": billing.get("Saudi Energy Charge SAR", 0) + billing.get("Saudi Meter Fee SAR", 0)},
+    {"Bill Source": "Premium charge", "Type": "Charge", "Amount SAR": billing.get("Premium Charge", 0)},
+    {"Bill Source": "Penalty / deadline penalty", "Type": "Charge", "Amount SAR": billing.get("Penalty", 0)},
+    {"Bill Source": "Repeated ignored-request penalty", "Type": "Charge", "Amount SAR": repeated_ignore_penalty},
+    {"Bill Source": "Fairness configuration adjustment", "Type": "Charge", "Amount SAR": fairness_config_adjustment},
+    {"Bill Source": "Grid support discount", "Type": "Credit", "Amount SAR": -billing.get("Grid Support Discount", 0)},
+    {"Bill Source": "Loyalty baseline discount", "Type": "Credit", "Amount SAR": -billing.get("Loyalty Discount", 0)},
+    {"Bill Source": "Good behavior discount", "Type": "Credit", "Amount SAR": -billing.get("Good Behavior Discount", 0)},
+    {"Bill Source": "Company growth discount", "Type": "Credit", "Amount SAR": -billing.get("Company Growth Discount", 0)},
+    {"Bill Source": "Medical charity discount", "Type": "Credit", "Amount SAR": -medical_charity_discount},
+    {"Bill Source": "Solar export credit sold to grid", "Type": "Credit", "Amount SAR": -solar_export_credit_sar},
+    {"Bill Source": "FINAL BILL", "Type": "Result", "Amount SAR": billing.get("Final Bill", 0)},
+])
+st.dataframe(bill_formula_df, use_container_width=True)
+st.info(
+    "Final Bill = base Saudi tariff after solar self-use + premium + penalty + fairness/repeated penalties "
+    "- explicit discount sources - solar export credit. Generic Discount, No Action Difference Internal, and  were removed."
+)
+
 
 # Save current scenario for the dynamic PDF report. The Sidebar and AI report buttons use this snapshot.
 try:
@@ -5037,48 +5053,16 @@ with tab2:
 
     st.plotly_chart(usage_fig, use_container_width=True)
 
-    bill_parts = pd.DataFrame({
-        "Component": [
-            "Premium Charge",
-            "Penalty",
-            "Timer Penalty",
-            "Penalty Waived",
-            "Bonus",
-            "Discount",
-            "Loyalty Discount",
-            "Good Behavior Discount",
-            "Amount Saved",
-            "Final Bill"
-        ],
-        "SAR": [
-            billing["Premium Charge"],
-            billing["Penalty"],
-            billing["Timer Penalty"],
-            billing["Penalty Waived"],
-            billing["Bonus"],
-            billing["Discount"],
-            billing["Loyalty Discount"],
-            billing["Good Behavior Discount"],
-            billing["Amount Saved"],
-            billing["Final Bill"]
-        ]
-    })
-
+    bill_parts = bill_formula_df[bill_formula_df["Amount SAR"].abs() > 0].copy()
     fig_bill = px.bar(
         bill_parts,
-        x="Component",
-        y="SAR",
-        title="Bill Components",
+        x="Bill Source",
+        y="Amount SAR",
+        color="Type",
+        title="Final Bill Breakdown: Charges vs Credits",
         text_auto=".2f"
     )
-
-    fig_bill.update_layout(
-        template="plotly_dark",
-        font=dict(size=18),
-        title_font=dict(size=26),
-        height=600
-    )
-
+    fig_bill.update_layout(template="plotly_dark", height=650, xaxis_tickangle=-35)
     st.plotly_chart(fig_bill, use_container_width=True)
 
 with tab3:
